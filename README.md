@@ -1,4 +1,4 @@
-# blaze
+# blaze (developing)
 Simple C++ http library
 
 

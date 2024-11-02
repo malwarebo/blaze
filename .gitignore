@@ -30,3 +30,27 @@
 *.exe
 *.out
 *.app
+
+# Build directory
+build/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Compiled files
+*.o
+*.so
+*.a
+*.exe
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+
+# Test related
+Testing/
+*.gcno
+*.gcda
+*.gcov

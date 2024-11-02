@@ -8,6 +8,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <map>
 
 /**
  * @class HTTPClient
@@ -25,52 +26,34 @@ public:
    */
   ~HTTPClient();
 
-  std::string sendRequest(const std::string &url,
-                          const std::string &requestType,
-                          const std::string &data,
-                          std::unordered_map<std::string, std::string> &headers);
+  // Disable copying
+  HTTPClient(const HTTPClient&) = delete;
+  HTTPClient& operator=(const HTTPClient&) = delete;
 
-  std::string buildRequest(const std::string &url,
-                           const std::string &requestType,
-                           const std::string &data);
+  // Configuration methods
+  void setTimeout(long seconds);
+  void setHeader(const std::string& key, const std::string& value);
+  void setContentType(const std::string& content_type);
 
-  /**
-   * @brief Sends a GET request to the specified URL.
-   * @param url The URL to send the GET request to.
-   * @return The response from the server.
-   */
-  std::string get(const std::string &url, std::unordered_map<std::string, std::string> &headers);
+  // HTTP methods
+  struct Response {
+    std::string body;
+    long status_code;
+    std::string error_message;
+    bool success;
+  };
 
-  /**
-   * @brief Sends a PUT request to the specified URL with the given data.
-   * @param url The URL to send the PUT request to.
-   * @param data The data to include in the request body.
-   * @return The response from the server.
-   */
-  std::string put(const std::string &url, const std::string &data, std::unordered_map<std::string, std::string> &headers);
+  Response get(const std::string& url);
+  Response post(const std::string& url, const std::string& data);
+  Response put(const std::string& url, const std::string& data);
+  Response del(const std::string& url);
 
-  /**
-   * @brief Sends an UPDATE request to the specified URL with the given data.
-   * @param url The URL to send the UPDATE request to.
-   * @param data The data to include in the request body.
-   * @return The response from the server.
-   */
-  std::string update(const std::string &url, const std::string &data, std::unordered_map<std::string, std::string> &headers);
+private:
+  Response sendRequest(const std::string& url, const std::string& requestType, const std::string& data);
 
-  /**
-   * @brief Sends a DELETE request to the specified URL.
-   * @param url The URL to send the DELETE request to.
-   * @return The response from the server.
-   */
-  std::string del(const std::string &url, std::unordered_map<std::string, std::string> &headers);
-
-  /**
-   * @brief Sends a POST request to the specified URL with the given data.
-   * @param url The URL to send the POST request to.
-   * @param data The data to include in the request body.
-   * @return The response from the server.
-   */
-  std::string post(const std::string &url, const std::string &data, std::unordered_map<std::string, std::string> &headers);
+  std::map<std::string, std::string> headers_;
+  long timeout_seconds_{30};
+  bool curl_initialized_{false};
 };
 
 #endif // HTTP_CLIENT_HPP

@@ -1,0 +1,58 @@
+name: CMake Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: windows-latest
+            curl_dir: 'C:/Program Files/curl'
+            vcpkg_triplet: 'x64-windows'
+          - os: ubuntu-latest
+            vcpkg_triplet: 'x64-linux'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Install vcpkg
+      uses: lukka/run-vcpkg@v7
+      with:
+        vcpkgGitCommitId: '2024.02.14'
+        setupOnly: true
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        vcpkg install curl:${{ matrix.vcpkg_triplet }}
+
+    - name: Configure CMake (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        cmake -B ${{github.workspace}}/build -DCMAKE_TOOLCHAIN_FILE=${{env.VCPKG_ROOT}}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} -DCMAKE_BUILD_TYPE=Release
+
+    - name: Configure CMake (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release
+
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C Release --output-on-failure 

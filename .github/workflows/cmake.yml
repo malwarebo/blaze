@@ -11,12 +11,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        include:
-          - os: windows-latest
-            curl_dir: 'C:/Program Files/curl'
-            vcpkg_triplet: 'x64-windows'
-          - os: ubuntu-latest
-            vcpkg_triplet: 'x64-linux'
 
     runs-on: ${{ matrix.os }}
 
@@ -29,30 +23,25 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libcurl4-openssl-dev
 
+    # Simpler vcpkg setup for Windows
     - name: Install vcpkg
-      uses: lukka/run-vcpkg@v7
+      if: runner.os == 'Windows'
+      uses: microsoft/setup-vcpkg@v1
       with:
-        vcpkgGitCommitId: '2024.02.14'
-        setupOnly: true
+        vcpkgGitCommitId: '5bc3d873d3f1d7cd989eabe743b835ca0270ef46'
 
     - name: Install dependencies (Windows)
       if: runner.os == 'Windows'
       run: |
-        vcpkg install curl:${{ matrix.vcpkg_triplet }}
+        vcpkg install curl:x64-windows
 
-    - name: Configure CMake (Windows)
-      if: runner.os == 'Windows'
+    - name: Configure CMake
       run: |
-        cmake -B ${{github.workspace}}/build -DCMAKE_TOOLCHAIN_FILE=${{env.VCPKG_ROOT}}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} -DCMAKE_BUILD_TYPE=Release
-
-    - name: Configure CMake (Ubuntu)
-      if: runner.os == 'Linux'
-      run: |
-        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release ${{ runner.os == 'Windows' && '-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake' || '' }}
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config Release
 
     - name: Test
       working-directory: ${{github.workspace}}/build
-      run: ctest -C Release --output-on-failure 
+      run: ctest -C Release --output-on-failure

@@ -7,8 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Find required packages
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(CURL REQUIRED libcurl)
+find_package(CURL REQUIRED)
 
 # Create library target
 add_library(blaze_http
@@ -27,12 +26,6 @@ target_include_directories(blaze_http
 target_link_libraries(blaze_http
     PUBLIC
         ${CURL_LIBRARIES}
-)
-
-# Set link directories
-target_link_directories(blaze_http
-    PUBLIC
-        ${CURL_LIBRARY_DIRS}
 )
 
 # Create example executable (optional)
@@ -76,7 +69,6 @@ FetchContent_MakeAvailable(googletest)
 # Create test executable
 add_executable(blaze_tests
     tests/test_http_client.cpp
-    tests/test_main.cpp
 )
 
 target_link_libraries(blaze_tests

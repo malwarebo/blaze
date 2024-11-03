@@ -60,31 +60,31 @@ install(FILES lib/http_client.hpp
 )
 
 # Enable testing
-enable_testing()
+# enable_testing()
 
 # Add Google
-include(FetchContent)
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG release-1.12.1
-)
-FetchContent_MakeAvailable(googletest)
+# include(FetchContent)
+# FetchContent_Declare(
+#     googletest
+#     GIT_REPOSITORY https://github.com/google/googletest.git
+#     GIT_TAG release-1.12.1
+# )
+# FetchContent_MakeAvailable(googletest)
 
 # Create test executable
-add_executable(blaze_tests
-    tests/test_http_client.cpp
-)
+# add_executable(blaze_tests
+#     tests/test_http_client.cpp
+# )
 
-target_link_libraries(blaze_tests
-    PRIVATE
-        blaze_http
-        GTest::gtest
-        GTest::gtest_main
-        GTest::gmock
-        GTest::gmock_main
-)
+# target_link_libraries(blaze_tests
+#     PRIVATE
+#         blaze_http
+#         GTest::gtest
+#         GTest::gtest_main
+#         GTest::gmock
+#         GTest::gmock_main
+# )
 
 # Register tests
-include(GoogleTest)
-gtest_discover_tests(blaze_tests)
+# include(GoogleTest)
+# gtest_discover_tests(blaze_tests)

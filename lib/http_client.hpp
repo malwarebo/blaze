@@ -1,59 +1,73 @@
-/**
- * @file http_client.hpp
- * @brief HTTPClient library for making HTTP requests.
- */
-
-#ifndef HTTP_CLIENT_HPP
-#define HTTP_CLIENT_HPP
+#pragma once
 
 #include <string>
-#include <unordered_map>
 #include <map>
+#include <memory>
+#include <functional>
+#include <vector>
+#include <future>
 
-/**
- * @class HTTPClient
- * @brief Class for making HTTP requests.
- */
-class HTTPClient {
-public:
-  /**
-   * @brief Default constructor.
-   */
-  HTTPClient();
+namespace blaze {
 
-  /**
-   * @brief Destructor.
-   */
-  ~HTTPClient();
-
-  // Disable copying
-  HTTPClient(const HTTPClient&) = delete;
-  HTTPClient& operator=(const HTTPClient&) = delete;
-
-  // Configuration methods
-  void setTimeout(long seconds);
-  void setHeader(const std::string& key, const std::string& value);
-  void setContentType(const std::string& content_type);
-
-  // HTTP methods
-  struct Response {
+struct HttpResponse {
+    int status_code;
+    std::map<std::string, std::string> headers;
     std::string body;
-    long status_code;
-    std::string error_message;
     bool success;
-  };
-
-  Response get(const std::string& url);
-  Response post(const std::string& url, const std::string& data);
-  Response put(const std::string& url, const std::string& data);
-  Response del(const std::string& url);
-
-private:
-  Response sendRequest(const std::string& url, const std::string& requestType, const std::string& data);
-
-  std::map<std::string, std::string> headers_;
-  long timeout_seconds_{30};
-  bool curl_initialized_{false};
+    std::string error_message;
 };
 
-#endif // HTTP_CLIENT_HPP
+struct HttpRequest {
+    std::string url;
+    std::string method = "GET";
+    std::map<std::string, std::string> headers;
+    std::string body;
+    int timeout_ms = 30000; // 30 seconds default timeout
+    bool follow_redirects = true;
+    int max_redirects = 5;
+};
+
+using ResponseCallback = std::function<void(const HttpResponse&)>;
+
+class HttpClient {
+public:
+    HttpClient();
+    ~HttpClient();
+
+    // Synchronous requests
+    HttpResponse get(const std::string& url, 
+                    const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse post(const std::string& url, 
+                     const std::string& body,
+                     const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse put(const std::string& url, 
+                    const std::string& body,
+                    const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse del(const std::string& url, 
+                    const std::map<std::string, std::string>& headers = {});
+    
+    // General request method
+    HttpResponse send(const HttpRequest& request);
+    
+    // Asynchronous requests
+    std::future<HttpResponse> sendAsync(const HttpRequest& request);
+    
+    // Set global default headers for all requests
+    void setDefaultHeader(const std::string& name, const std::string& value);
+    
+    // Set timeout for all requests in milliseconds
+    void setTimeout(int timeout_ms);
+    
+    // Configure redirect behavior
+    void setFollowRedirects(bool follow);
+    void setMaxRedirects(int max_redirects);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> pimpl;
+};
+
+} // namespace blaze

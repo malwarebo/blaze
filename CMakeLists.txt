@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.14)
 project(blaze VERSION 1.0.0 LANGUAGES CXX)
 
 # Set C++ standard
@@ -6,85 +6,60 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Windows-specific settings
-if(WIN32)
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-endif()
-
-# Find required packages
+# Find libcurl for HTTP requests
 find_package(CURL REQUIRED)
 
-# Create library target
-add_library(blaze_http
+# Main library
+add_library(blaze_http 
     lib/http_client.cpp
-    lib/http_client.hpp
 )
 
-# Set include directories for the library
-target_include_directories(blaze_http
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/lib
-        ${CURL_INCLUDE_DIRS}
+target_include_directories(blaze_http PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib
 )
 
-# Link dependencies
-target_link_libraries(blaze_http
-    PUBLIC
-        ${CURL_LIBRARIES}
+target_link_libraries(blaze_http PUBLIC 
+    CURL::libcurl
 )
 
-# Create example executable (optional)
-option(BUILD_EXAMPLES "Build example programs" OFF)
-
-if(BUILD_EXAMPLES)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/main.cpp")
-        add_executable(blaze_example examples/main.cpp)
-        target_link_libraries(blaze_example
-            PRIVATE
-                blaze_http
-        )
-    else()
-        message(STATUS "Example file not found - skipping example build")
-    endif()
-endif()
-
-# Install rules (optional)
-install(TARGETS blaze_http
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
+# Example executable
+add_executable(blaze_example
+    examples/main.cpp
 )
 
-install(FILES lib/http_client.hpp
-    DESTINATION include/blaze
+target_link_libraries(blaze_example PRIVATE
+    blaze_http
 )
 
-# Enable testing
-# enable_testing()
+# Blaze main executable
+add_executable(blaze
+    blaze/blaze/main.cpp
+)
 
-# Add Google
-# include(FetchContent)
-# FetchContent_Declare(
-#     googletest
-#     GIT_REPOSITORY https://github.com/google/googletest.git
-#     GIT_TAG release-1.12.1
-# )
-# FetchContent_MakeAvailable(googletest)
+target_link_libraries(blaze PRIVATE
+    blaze_http
+)
 
-# Create test executable
-# add_executable(blaze_tests
-#     tests/test_http_client.cpp
-# )
+# Tests
+enable_testing()
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.14.0
+)
+FetchContent_MakeAvailable(googletest)
 
-# target_link_libraries(blaze_tests
-#     PRIVATE
-#         blaze_http
-#         GTest::gtest
-#         GTest::gtest_main
-#         GTest::gmock
-#         GTest::gmock_main
-# )
+add_executable(blaze_tests
+    tests/test_http_client.cpp
+)
 
-# Register tests
-# include(GoogleTest)
-# gtest_discover_tests(blaze_tests)
+target_link_libraries(blaze_tests PRIVATE
+    blaze_http
+    gtest
+    gtest_main
+    gmock
+)
+
+include(GoogleTest)
+gtest_discover_tests(blaze_tests)

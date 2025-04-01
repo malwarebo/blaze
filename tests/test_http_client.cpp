@@ -1,63 +1,110 @@
 #include <gtest/gtest.h>
-#include "http_client.hpp"
-#include <gmock/gmock.h>
+#include "../lib/http_client.hpp"
+#include <string>
+#include <thread>
+#include <chrono>
 
-// Mock HTTP client for testing
-class MockHTTPClient : public HTTPClient {
-public:
-    MOCK_METHOD(HTTPResponse, get, (const std::string& url), (override));
-    MOCK_METHOD(HTTPResponse, post, (const std::string& url, const std::string& data), (override));
-};
-
-class HTTPClientTest : public ::testing::Test {
+class HttpClientTest : public ::testing::Test {
 protected:
-    MockHTTPClient client;
+    blaze::HttpClient client;
 };
 
-// Test GET request
-TEST_F(HTTPClientTest, BasicGetRequest) {
-    HTTPResponse mockResponse;
-    mockResponse.success = true;
-    mockResponse.status_code = 200;
-    mockResponse.body = R"({"login": "octocat"})";
+TEST_F(HttpClientTest, GetRequest) {
+    auto response = client.get("https://httpbin.org/get");
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_FALSE(response.body.empty());
+    EXPECT_TRUE(response.body.find("\"url\": \"https://httpbin.org/get\"") != std::string::npos);
+}
 
-    EXPECT_CALL(client, get("https://api.github.com/users/octocat"))
-        .WillOnce(::testing::Return(mockResponse));
+TEST_F(HttpClientTest, PostRequest) {
+    std::string body = "test=value&foo=bar";
+    std::map<std::string, std::string> headers = {
+        {"Content-Type", "application/x-www-form-urlencoded"}
+    };
+    
+    auto response = client.post("https://httpbin.org/post", body, headers);
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_FALSE(response.body.empty());
+    EXPECT_TRUE(response.body.find("\"form\": {") != std::string::npos);
+    EXPECT_TRUE(response.body.find("\"test\": \"value\"") != std::string::npos);
+}
 
-    auto response = client.get("https://api.github.com/users/octocat");
-    EXPECT_TRUE(response.success);
-    EXPECT_EQ(response.status_code, 200);
+TEST_F(HttpClientTest, PutRequest) {
+    std::string body = "{\"name\": \"test\"}";
+    std::map<std::string, std::string> headers = {
+        {"Content-Type", "application/json"}
+    };
+    
+    auto response = client.put("https://httpbin.org/put", body, headers);
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_FALSE(response.body.empty());
+    EXPECT_TRUE(response.body.find("\"json\": {") != std::string::npos);
+    EXPECT_TRUE(response.body.find("\"name\": \"test\"") != std::string::npos);
+}
+
+TEST_F(HttpClientTest, DeleteRequest) {
+    auto response = client.del("https://httpbin.org/delete");
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_FALSE(response.body.empty());
+    EXPECT_TRUE(response.body.find("\"url\": \"https://httpbin.org/delete\"") != std::string::npos);
+}
+
+TEST_F(HttpClientTest, NotFoundStatus) {
+    auto response = client.get("https://httpbin.org/status/404");
+    ASSERT_TRUE(response.success); // Request succeeded, even though we got 404
+    EXPECT_EQ(404, response.status_code);
+}
+
+TEST_F(HttpClientTest, DefaultHeaders) {
+    client.setDefaultHeader("X-Test-Header", "test-value");
+    auto response = client.get("https://httpbin.org/headers");
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_TRUE(response.body.find("\"X-Test-Header\": \"test-value\"") != std::string::npos);
+}
+
+TEST_F(HttpClientTest, Timeout) {
+    // Set a very short timeout
+    client.setTimeout(50); // 50ms
+    
+    auto response = client.get("https://httpbin.org/delay/2");
+    EXPECT_FALSE(response.success);
+    EXPECT_TRUE(response.error_message.find("timeout") != std::string::npos);
+}
+
+TEST_F(HttpClientTest, FollowRedirects) {
+    // Enable redirect following
+    client.setFollowRedirects(true);
+    
+    auto response = client.get("https://httpbin.org/redirect/2");
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    
+    // Disable redirect following
+    client.setFollowRedirects(false);
+    
+    response = client.get("https://httpbin.org/redirect/2");
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(302, response.status_code); // Should receive redirect status
+}
+
+TEST_F(HttpClientTest, AsyncRequest) {
+    auto future = client.sendAsync({"https://httpbin.org/get", "GET"});
+    
+    // Do other work...
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    auto response = future.get();
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
     EXPECT_FALSE(response.body.empty());
 }
 
-// Test invalid URL
-TEST_F(HTTPClientTest, InvalidURL) {
-    HTTPResponse mockResponse;
-    mockResponse.success = false;
-    mockResponse.status_code = 0;
-
-    EXPECT_CALL(client, get("https://invalid.url.that.does.not.exist"))
-        .WillOnce(::testing::Return(mockResponse));
-
-    auto response = client.get("https://invalid.url.that.does.not.exist");
-    EXPECT_FALSE(response.success);
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }
-
-// Test POST request
-TEST_F(HTTPClientTest, BasicPostRequest) {
-    std::string data = R"({"test": "data"})";
-    HTTPResponse mockResponse;
-    mockResponse.success = true;
-    mockResponse.status_code = 200;
-    mockResponse.body = R"({"data": {"test": "data"}})";
-
-    EXPECT_CALL(client, post("https://postman-echo.com/post", data))
-        .WillOnce(::testing::Return(mockResponse));
-
-    client.setContentType("application/json");
-    auto response = client.post("https://postman-echo.com/post", data);
-    EXPECT_TRUE(response.success);
-    EXPECT_EQ(response.status_code, 200);
-}
-
-// Remove or modify timeout test as it depends on real HTTP calls

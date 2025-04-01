@@ -1,133 +1,251 @@
 #include "http_client.hpp"
 #include <curl/curl.h>
 #include <iostream>
-#include <map>
+#include <sstream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
-// Constructor
-HTTPClient::HTTPClient() {
-    // Initialize CURL globally
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl_initialized_ = true;
+namespace blaze {
+
+// Callback function for writing received data
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
+    size_t total_size = size * nmemb;
+    userp->append(static_cast<char*>(contents), total_size);
+    return total_size;
 }
 
-// Destructor
-HTTPClient::~HTTPClient() {
-    if (curl_initialized_) {
+// Callback function for headers
+static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, std::map<std::string, std::string>* userdata) {
+    size_t total_size = size * nitems;
+    std::string header(buffer, total_size);
+    
+    // Remove trailing \r\n
+    if (header.size() > 2) {
+        header = header.substr(0, header.size() - 2);
+        
+        // Parse header
+        size_t separator = header.find(':');
+        if (separator != std::string::npos) {
+            std::string name = header.substr(0, separator);
+            std::string value = header.substr(separator + 1);
+            
+            // Trim leading spaces in value
+            size_t value_start = value.find_first_not_of(" ");
+            if (value_start != std::string::npos) {
+                value = value.substr(value_start);
+            }
+            
+            // Convert header name to lowercase for case-insensitive lookup
+            std::transform(name.begin(), name.end(), name.begin(), 
+                           [](unsigned char c){ return std::tolower(c); });
+            
+            (*userdata)[name] = value;
+        }
+    }
+    
+    return total_size;
+}
+
+// Private implementation class
+class HttpClient::Impl {
+public:
+    Impl() {
+        curl_global_init(CURL_GLOBAL_ALL);
+        timeout_ms = 30000;
+        follow_redirects = true;
+        max_redirects = 5;
+    }
+    
+    ~Impl() {
         curl_global_cleanup();
     }
-}
-
-// Callback function to write response data into a string
-static size_t writeCallback(void *contents, size_t size, size_t nmemb,
-                            std::string *response) {
-  size_t totalSize = size * nmemb;
-  response->append(static_cast<char *>(contents), totalSize);
-  return totalSize;
-}
-
-// Helper function to send HTTP request
-HTTPClient::Response HTTPClient::sendRequest(const std::string &url,
-                                    const std::string &requestType,
-                                    const std::string &data) {
-    Response response{};
-    CURL* curl = curl_easy_init();
     
-    if (!curl) {
+    HttpResponse performRequest(const HttpRequest& request) {
+        CURL* curl = curl_easy_init();
+        HttpResponse response;
         response.success = false;
-        response.error_message = "Failed to initialize CURL";
-        return response;
-    }
-
-    // Use RAII for curl cleanup
-    struct CURLGuard {
-        CURL* curl;
-        curl_slist* headers;
-        CURLGuard(CURL* c) : curl(c), headers(nullptr) {}
-        ~CURLGuard() {
-            if (headers) curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
+        
+        if (!curl) {
+            response.error_message = "Failed to initialize curl";
+            return response;
         }
-    } guard(curl);
-
-    // Setup headers
-    curl_slist* headers = nullptr;
-    for (const auto& [key, value] : headers_) {
-        std::string header = key + ": " + value;
-        headers = curl_slist_append(headers, header.c_str());
-    }
-    guard.headers = headers;
-
-    // Basic CURL setup
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds_);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    
-    // SSL/TLS options
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    // Set the request type
-    if (requestType == "GET") {
-      curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    } else if (requestType == "PUT") {
-      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-    } else if (requestType == "DELETE") {
-      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    } else if (requestType == "POST") {
-      curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    }
-
-    // Set the request data (if any)
-    if (!data.empty()) {
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-    }
-
-    // Perform the request
-    CURLcode res = curl_easy_perform(curl);
-
-    if (res != CURLE_OK) {
-        response.success = false;
-        response.error_message = curl_easy_strerror(res);
+        
+        std::string responseBody;
+        
+        // Set URL
+        curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
+        
+        // Set request method
+        if (request.method == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            if (!request.body.empty()) {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.c_str());
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, request.body.size());
+            }
+        } else if (request.method == "PUT") {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+            if (!request.body.empty()) {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.c_str());
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, request.body.size());
+            }
+        } else if (request.method == "DELETE") {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        } else if (request.method != "GET") {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, request.method.c_str());
+        }
+        
+        // Set writing callback function
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+        
+        // Set header callback function
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response.headers);
+        
+        // Set timeout
+        int timeout = (request.timeout_ms > 0) ? request.timeout_ms : timeout_ms;
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout);
+        
+        // Set redirect behavior
+        bool follow = request.follow_redirects ? request.follow_redirects : follow_redirects;
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
+        
+        int max_redir = (request.max_redirects > 0) ? request.max_redirects : max_redirects;
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, max_redir);
+        
+        // Set headers
+        struct curl_slist* chunk = nullptr;
+        
+        // Add default headers
+        for (const auto& header : defaultHeaders) {
+            std::string headerStr = header.first + ": " + header.second;
+            chunk = curl_slist_append(chunk, headerStr.c_str());
+        }
+        
+        // Add request-specific headers
+        for (const auto& header : request.headers) {
+            std::string headerStr = header.first + ": " + header.second;
+            chunk = curl_slist_append(chunk, headerStr.c_str());
+        }
+        
+        if (chunk) {
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+        }
+        
+        // Set SSL verification (enabled by default)
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        
+        // Perform the request
+        CURLcode res = curl_easy_perform(curl);
+        
+        if (res == CURLE_OK) {
+            response.success = true;
+            response.body = responseBody;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+        } else {
+            response.error_message = curl_easy_strerror(res);
+        }
+        
+        // Clean up
+        if (chunk) {
+            curl_slist_free_all(chunk);
+        }
+        curl_easy_cleanup(curl);
+        
         return response;
     }
+    
+    std::map<std::string, std::string> defaultHeaders;
+    int timeout_ms;
+    bool follow_redirects;
+    int max_redirects;
+};
 
-    // Get status code
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
-    response.success = (response.status_code >= 200 && response.status_code < 300);
-
-    return response;
+// HttpClient implementation
+HttpClient::HttpClient() : pimpl(std::make_unique<Impl>()) {
+    // Set some sensible default headers
+    setDefaultHeader("User-Agent", "Blaze/1.0");
+    setDefaultHeader("Accept", "*/*");
 }
 
-// Send GET request
-HTTPClient::Response HTTPClient::get(const std::string &url) {
-    return sendRequest(url, "GET", "");
+HttpClient::~HttpClient() = default;
+
+HttpResponse HttpClient::get(const std::string& url, const std::map<std::string, std::string>& headers) {
+    HttpRequest request;
+    request.url = url;
+    request.method = "GET";
+    request.headers = headers;
+    return send(request);
 }
 
-// Send PUT request
-HTTPClient::Response HTTPClient::put(const std::string &url, const std::string &data) {
-    return sendRequest(url, "PUT", data);
+HttpResponse HttpClient::post(const std::string& url, 
+                            const std::string& body,
+                            const std::map<std::string, std::string>& headers) {
+    HttpRequest request;
+    request.url = url;
+    request.method = "POST";
+    request.body = body;
+    request.headers = headers;
+    
+    // Set Content-Type header if not specified
+    if (headers.find("Content-Type") == headers.end() && !body.empty()) {
+        request.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
+    
+    return send(request);
 }
 
-// Send DELETE request
-HTTPClient::Response HTTPClient::del(const std::string &url) {
-    return sendRequest(url, "DELETE", "");
+HttpResponse HttpClient::put(const std::string& url, 
+                           const std::string& body,
+                           const std::map<std::string, std::string>& headers) {
+    HttpRequest request;
+    request.url = url;
+    request.method = "PUT";
+    request.body = body;
+    request.headers = headers;
+    
+    // Set Content-Type header if not specified
+    if (headers.find("Content-Type") == headers.end() && !body.empty()) {
+        request.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
+    
+    return send(request);
 }
 
-// Send POST request
-HTTPClient::Response HTTPClient::post(const std::string &url, const std::string &data) {
-    return sendRequest(url, "POST", data);
+HttpResponse HttpClient::del(const std::string& url, const std::map<std::string, std::string>& headers) {
+    HttpRequest request;
+    request.url = url;
+    request.method = "DELETE";
+    request.headers = headers;
+    return send(request);
 }
 
-void HTTPClient::setTimeout(long seconds) {
-    timeout_seconds_ = seconds;
+HttpResponse HttpClient::send(const HttpRequest& request) {
+    return pimpl->performRequest(request);
 }
 
-void HTTPClient::setHeader(const std::string& key, const std::string& value) {
-    headers_[key] = value;
+std::future<HttpResponse> HttpClient::sendAsync(const HttpRequest& request) {
+    return std::async(std::launch::async, [this, request]() {
+        return this->send(request);
+    });
 }
 
-void HTTPClient::setContentType(const std::string& content_type) {
-    headers_["Content-Type"] = content_type;
+void HttpClient::setDefaultHeader(const std::string& name, const std::string& value) {
+    pimpl->defaultHeaders[name] = value;
 }
+
+void HttpClient::setTimeout(int timeoutMs) {
+    pimpl->timeout_ms = timeoutMs;
+}
+
+void HttpClient::setFollowRedirects(bool follow) {
+    pimpl->follow_redirects = follow;
+}
+
+void HttpClient::setMaxRedirects(int max) {
+    pimpl->max_redirects = max;
+}
+
+} // namespace blaze

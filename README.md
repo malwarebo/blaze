@@ -1,18 +1,6 @@
-# Blaze HTTP Client
+# blaze
 
-A modern, lightweight, and easy-to-use C++ HTTP client library built on top of libcurl. Designed for simplicity and efficiency, Blaze provides a clean interface for making HTTP requests while handling all the complexity of HTTP communications under the hood.
-
-## Features
-
-- 🚀 Simple and intuitive API
-- 🔒 Built-in SSL/TLS support
-- 📡 Support for all standard HTTP methods (GET, POST, PUT, DELETE)
-- ⚙️ Configurable timeout settings
-- 🎯 Custom header management
-- ⚡ Thread-safe design
-- 🛡️ Exception-safe operations
-- 📝 Comprehensive error handling
-- 🔄 Automatic memory management
+A modern, lightweight, and easy-to-use C++ HTTP client library built on top of libcurl. Designed for simplicity and efficiency, blaze provides a clean interface for making HTTP requests while handling all the complexity of HTTP communications under the hood.
 
 ## Requirements
 
@@ -24,23 +12,28 @@ A modern, lightweight, and easy-to-use C++ HTTP client library built on top of l
 ### Installing Dependencies
 
 #### Ubuntu/Debian
+
 ```bash
 sudo apt-get update
 sudo apt-get install build-essential cmake libcurl4-openssl-dev
 ```
 
 #### Fedora
+
 ```bash
 sudo dnf install gcc-c++ cmake libcurl-devel
 ```
 
 #### macOS
+
 ```bash
 brew install cmake curl
 ```
 
 #### Windows
+
 Install [vcpkg](https://github.com/Microsoft/vcpkg) and then:
+
 ```bash
 vcpkg install curl:x64-windows
 ```
@@ -48,10 +41,6 @@ vcpkg install curl:x64-windows
 ## Building
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/blaze-http.git
-cd blaze-http
-
 # Create build directory
 mkdir build && cd build
 
@@ -67,12 +56,13 @@ make
 ## Usage
 
 ### Basic GET Request
+
 ```cpp
 #include <blaze/http_client.hpp>
 #include <iostream>
 
 int main() {
-    HTTPClient client;
+    blaze::HttpClient client;
     
     auto response = client.get("https://api.example.com/data");
     if (response.success) {
@@ -83,68 +73,158 @@ int main() {
 ```
 
 ### POST Request with Headers
+
 ```cpp
-HTTPClient client;
+#include <blaze/http_client.hpp>
+#include <iostream>
 
-// Configure client
-client.setContentType("application/json");
-client.setHeader("Authorization", "Bearer your-token-here");
-
-// Make POST request
-std::string data = R"({"key": "value"})";
-auto response = client.post("https://api.example.com/create", data);
-
-if (response.success) {
-    std::cout << "Created successfully!" << std::endl;
-} else {
-    std::cerr << "Error: " << response.error_message << std::endl;
+int main() {
+    blaze::HttpClient client;
+    
+    // Set default headers
+    client.setDefaultHeader("Authorization", "Bearer your-token-here");
+    
+    // Make POST request
+    std::string data = R"({"key": "value"})";
+    std::map<std::string, std::string> headers = {{"Content-Type", "application/json"}};
+    
+    auto response = client.post("https://api.example.com/create", data, headers);
+    
+    if (response.success) {
+        std::cout << "Created successfully!" << std::endl;
+    } else {
+        std::cerr << "Error: " << response.error_message << std::endl;
+    }
 }
 ```
 
 ### Handling Timeouts
-```cpp
-HTTPClient client;
-client.setTimeout(30); // 30 seconds timeout
 
+```cpp
+blaze::HttpClient client;
+client.setTimeout(30000); // 30 seconds timeout (in milliseconds)
 auto response = client.get("https://api.example.com/data");
+```
+
+### Asynchronous Requests
+
+```cpp
+#include <blaze/http_client.hpp>
+#include <iostream>
+#include <future>
+
+int main() {
+    blaze::HttpClient client;
+    
+    // Start an asynchronous request
+    auto future_response = client.sendAsync({"https://api.example.com/data", "GET"});
+    
+    // Do other work while request is processing
+    std::cout << "Request started, doing other work..." << std::endl;
+    
+    // Wait for and process the response
+    auto response = future_response.get();
+    
+    if (response.success) {
+        std::cout << "Got async response: " << response.body << std::endl;
+    }
+}
+```
+
+### Using the Request Structure for Complex Requests
+
+```cpp
+blaze::HttpRequest request;
+request.url = "https://api.example.com/data";
+request.method = "PUT";
+request.body = R"({"updated": true})";
+request.headers = {
+    {"Content-Type", "application/json"},
+    {"Authorization", "Bearer token"}
+};
+request.timeout_ms = 5000;      // 5 seconds
+request.follow_redirects = true;
+request.max_redirects = 3;
+
+auto response = client.send(request);
 ```
 
 ## API Reference
 
-### HTTPClient Class
+### HttpClient Class
+
 ```cpp
-class HTTPClient {
+namespace blaze {
+class HttpClient {
 public:
     // Constructor and destructor
-    HTTPClient();
-    ~HTTPClient();
-
+    HttpClient();
+    ~HttpClient();
+    
+    // Synchronous HTTP methods
+    HttpResponse get(const std::string& url, 
+                    const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse post(const std::string& url, 
+                    const std::string& body,
+                    const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse put(const std::string& url, 
+                    const std::string& body,
+                    const std::map<std::string, std::string>& headers = {});
+    
+    HttpResponse del(const std::string& url, 
+                    const std::map<std::string, std::string>& headers = {});
+    
+    // General request method
+    HttpResponse send(const HttpRequest& request);
+    
+    // Asynchronous request method
+    std::future<HttpResponse> sendAsync(const HttpRequest& request);
+    
     // Configuration methods
-    void setTimeout(long seconds);
-    void setHeader(const std::string& key, const std::string& value);
-    void setContentType(const std::string& content_type);
-
-    // HTTP methods
-    Response get(const std::string& url);
-    Response post(const std::string& url, const std::string& data);
-    Response put(const std::string& url, const std::string& data);
-    Response del(const std::string& url);
+    void setDefaultHeader(const std::string& name, const std::string& value);
+    void setTimeout(int timeout_ms);
+    void setFollowRedirects(bool follow);
+    void setMaxRedirects(int max_redirects);
 };
+}
 ```
 
-### Response Structure
+### HttpRequest Structure
+
 ```cpp
-struct Response {
-    std::string body;        // Response body
-    long status_code;        // HTTP status code
-    std::string error_message; // Error message if any
-    bool success;            // True if request was successful
+namespace blaze {
+struct HttpRequest {
+    std::string url;
+    std::string method = "GET";
+    std::map<std::string, std::string> headers;
+    std::string body;
+    int timeout_ms = 30000; // 30 seconds default timeout
+    bool follow_redirects = true;
+    int max_redirects = 5;
 };
+}
+```
+
+### HttpResponse Structure
+
+```cpp
+namespace blaze {
+struct HttpResponse {
+    int status_code;
+    std::map<std::string, std::string> headers;
+    std::string body;
+    bool success;
+    std::string error_message;
+};
+}
 ```
 
 ## Error Handling
 
 The library uses a combination of error codes and messages to handle errors:
+
 - HTTP status codes are available in `response.status_code`
 - Detailed error messages are provided in `response.error_message`
 - Quick success check via `response.success`
@@ -159,13 +239,14 @@ if (!response.success) {
 
 ## Thread Safety
 
-The `HTTPClient` class is designed to be thread-safe for different instances. However, using the same instance across multiple threads requires external synchronization.
+The `HttpClient` class is designed to be thread-safe for different instances. However, using the same instance across multiple threads requires external synchronization.
+
+## Asynchronous Operations
+
+The library supports asynchronous operations through the `sendAsync` method, which returns a `std::future<HttpResponse>`. This allows you to continue execution while the HTTP request is being processed in the background.
 
 ## Acknowledgments
 
 - Built with [libcurl](https://curl.se/libcurl/)
+- Testing with [Google Test](https://github.com/google/googletest)
 - Inspired by modern C++ design principles
-
-## Support
-
-If you encounter any issues or have questions, please file an issue on the GitHub repository.

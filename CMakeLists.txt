@@ -31,15 +31,6 @@ target_link_libraries(blaze_example PRIVATE
     blaze_http
 )
 
-# Blaze main executable
-add_executable(blaze
-    blaze/blaze/main.cpp
-)
-
-target_link_libraries(blaze PRIVATE
-    blaze_http
-)
-
 # Tests
 enable_testing()
 include(FetchContent)

@@ -38,6 +38,11 @@ build/
 .vscode/
 .idea/
 *.swp
+*.xcodeproj/
+*.xcworkspace/
+*.xcuserstate
+*.xcscheme
+.DS_Store
 
 # Compiled files
 *.o

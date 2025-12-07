@@ -1,17 +1,23 @@
-# blaze
+<p align="center">
+  <img src="assets/logo.svg" alt="Blaze Logo" width="150" height="150">
+</p>
 
-A modern, comprehensive, and high-performance C++ HTTP client library built on top of libcurl. Designed for production use with enterprise-grade features including connection pooling, authentication, streaming, monitoring, and advanced error handling.
+<h1 align="center">Blaze</h1>
 
-## Features
+<p align="center">
+  <strong>A modern high-performance C++ HTTP client library</strong>
+</p>
 
-- **High Performance**: Connection pooling, compression, keep-alive
-- **Security**: SSL/TLS configuration, multiple authentication methods
-- **Developer Friendly**: Builder pattern, fluent API, comprehensive error handling
-- **Monitoring**: Request metrics, logging, progress tracking
-- **Reliability**: Retry logic with exponential backoff
-- **Streaming**: Response streaming for large data
-- **Flexible**: Interceptors, custom configuration, proxy support
-- **Utilities**: URL encoding, Base64, query string parsing
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#examples">Examples</a> •
+  <a href="#api-reference">API Reference</a> •
+  <a href="#contributing">Contributing</a>
+</p>
+
+---
+
+A modern high-performance C++ HTTP client library built on top of libcurl. It offers features including connection pooling, authentication, streaming, monitoring, and proper error handling.
 
 ## Requirements
 
@@ -115,6 +121,7 @@ if (response.isSuccess()) {
 ### Authentication
 
 #### Basic Authentication
+
 ```cpp
 blaze::HttpClient client;
 client.setBasicAuth("username", "password");
@@ -122,6 +129,7 @@ auto response = client.get("https://api.example.com/protected");
 ```
 
 #### Bearer Token
+
 ```cpp
 auto response = blaze::HttpClient::builder()
     .url("https://api.example.com/data")
@@ -130,6 +138,7 @@ auto response = blaze::HttpClient::builder()
 ```
 
 #### API Key
+
 ```cpp
 blaze::HttpClient client;
 client.setApiKey("your-api-key", "X-API-Key");
@@ -216,6 +225,7 @@ client.addResponseInterceptor([](blaze::HttpResponse& resp) {
 ### File Operations
 
 #### Upload File
+
 ```cpp
 auto response = client.uploadFile(
     "https://api.example.com/upload",
@@ -226,6 +236,7 @@ auto response = client.uploadFile(
 ```
 
 #### Download File
+
 ```cpp
 auto response = client.downloadFile(
     "https://api.example.com/download/file.zip",
@@ -233,7 +244,7 @@ auto response = client.downloadFile(
 );
 ```
 
-### Error Handling with Status Code Helpers
+### Error Handling with Status Code
 
 ```cpp
 auto response = client.get("https://api.example.com/data");
@@ -333,7 +344,7 @@ public:
     void setProxy(const ProxyConfig& proxy);
     void clearProxy();
     
-    // Retry & Resilience
+    // Retry
     void enableRetry(int max_attempts = 3);
     void disableRetry();
     
@@ -357,6 +368,7 @@ public:
 ### Key Structures
 
 #### HttpResponse
+
 ```cpp
 struct HttpResponse {
     int status_code{0};
@@ -378,6 +390,7 @@ struct HttpResponse {
 ```
 
 #### HttpRequest
+
 ```cpp
 struct HttpRequest {
     std::string url;
@@ -394,6 +407,7 @@ struct HttpRequest {
 ```
 
 #### HttpMetrics
+
 ```cpp
 struct HttpMetrics {
     std::chrono::milliseconds total_time{0};
@@ -444,36 +458,9 @@ enum class ErrorType {
 };
 ```
 
-## Thread Safety
+## Example
 
-- **Different instances**: Fully thread-safe
-- **Same instance**: Requires external synchronization
-- **Connection pooling**: Thread-safe when enabled
-- **Async operations**: Safe to use concurrently
-
-## Performance Features
-
-- **Connection Pooling**: Reuses connections for better performance
-- **Compression**: Automatic gzip/deflate support
-- **Keep-Alive**: Persistent connections
-- **Async Operations**: Non-blocking requests
-- **Streaming**: Memory-efficient for large responses
-- **Metrics**: Built-in performance monitoring
-
-## Best Practices
-
-1. **Use Builder Pattern** for complex requests
-2. **Enable Connection Pooling** for high-throughput applications
-3. **Set Appropriate Timeouts** for your use case
-4. **Handle Errors Properly** using status code helpers
-5. **Use Streaming** for large responses
-6. **Monitor Performance** with built-in metrics
-7. **Configure Retry Logic** for resilient applications
-8. **Use Interceptors** for cross-cutting concerns
-
-## Examples in the Wild
-
-Run the comprehensive example to see all features in action:
+Run the example included to see all features in action:
 
 ```bash
 cd build
@@ -482,16 +469,7 @@ cd build
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Run the test suite: `./blaze_tests`
-6. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Contributions to this project are endorsed.
 
 ## Acknowledgments
 
@@ -499,22 +477,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Testing with [Google Test](https://github.com/google/googletest) - Google's C++ test framework
 - Inspired by modern HTTP client libraries and C++17 design principles
 - Performance optimizations based on production use cases
-
-## Changelog
-
-### v2.0.0
-
-- Complete rewrite with enterprise-grade features
-- Builder pattern for fluent API
-- Enhanced authentication and SSL support
-- Connection pooling and performance optimizations
-- Comprehensive metrics and monitoring
-- Response streaming capabilities
-- Retry logic with exponential backoff
-- Request/response interceptors
-- Utility functions for common tasks
-- 42 comprehensive test cases
-
-### v1.0.0
-
-- Initial release with basic HTTP functionality

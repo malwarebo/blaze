@@ -1,168 +1,114 @@
-#include "../lib/http_client.hpp"
+#include "blaze.hpp"
 #include <iostream>
 #include <chrono>
-#include <thread>
-#include <iomanip>
 
-void printSeparator(const std::string& title) {
-    std::cout << "\n" << std::string(50, '=') << std::endl;
-    std::cout << "  " << title << std::endl;
-    std::cout << std::string(50, '=') << std::endl;
+void syncExamples() {
+    std::cout << "=== Sync Examples ===" << std::endl;
+
+    blaze::HttpClient client;
+
+    auto response = client.get("https://httpbin.org/get");
+    std::cout << "[GET] " << response.status_code << " (" << response.body.size() << " bytes)\n";
+
+    auto post_resp = client.post("https://httpbin.org/post",
+                                 R"({"key":"value"})",
+                                 {{"Content-Type", "application/json"}});
+    std::cout << "[POST] " << post_resp.status_code << "\n";
+
+    auto builder_resp = blaze::HttpClient::builder()
+        .url("https://httpbin.org/headers")
+        .method("GET")
+        .header("X-Custom", "blaze")
+        .send();
+    std::cout << "[Builder] " << builder_resp.status_code << "\n";
 }
 
-void printResponse(const blaze::HttpResponse& response) {
-    std::cout << "Status: " << response.status_code;
-    if (response.isSuccess()) {
-        std::cout << " (Success)";
-    } else if (response.isClientError()) {
-        std::cout << " (Client Error)";
-    } else if (response.isServerError()) {
-        std::cout << " (Server Error)";
+blaze::Task<void> asyncExamples() {
+    std::cout << "\n=== Async Examples ===" << std::endl;
+
+    blaze::HttpClient client;
+
+    auto response = co_await client.async_get("https://httpbin.org/get");
+    std::cout << "[async GET] " << response.status_code
+              << " (" << response.body.size() << " bytes)\n";
+
+    auto post_resp = co_await client.async_post("https://httpbin.org/post",
+                                                 R"({"async":true})");
+    std::cout << "[async POST] " << post_resp.status_code << "\n";
+}
+
+blaze::Task<void> parallelExample() {
+    std::cout << "\n=== Parallel (when_all) ===" << std::endl;
+
+    blaze::HttpClient client;
+
+    auto start = std::chrono::steady_clock::now();
+
+    auto [r1, r2, r3] = co_await blaze::when_all(
+        client.async_get("https://httpbin.org/delay/1"),
+        client.async_get("https://httpbin.org/delay/1"),
+        client.async_get("https://httpbin.org/delay/1")
+    );
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    std::cout << "3 requests (1s each) completed in " << elapsed.count() << "ms\n";
+    std::cout << "Status codes: " << r1.status_code << ", "
+              << r2.status_code << ", " << r3.status_code << "\n";
+}
+
+blaze::Task<void> raceExample() {
+    std::cout << "\n=== Race (async_race) ===" << std::endl;
+
+    blaze::HttpClient client;
+
+    std::vector<blaze::HttpRequest> requests;
+    for (int i = 0; i < 3; ++i) {
+        blaze::HttpRequest req;
+        req.url = "https://httpbin.org/delay/" + std::to_string(i + 1);
+        req.method = "GET";
+        requests.push_back(std::move(req));
     }
-    std::cout << std::endl;
-    
-    if (response.success) {
-        std::cout << "Response size: " << response.body.size() << " bytes" << std::endl;
-        std::cout << "Request ID: " << response.request_id << std::endl;
-        
-        if (response.metrics.total_time.count() > 0) {
-            std::cout << "Metrics:" << std::endl;
-            std::cout << "  Total time: " << response.metrics.total_time.count() << "ms" << std::endl;
-            std::cout << "  Download size: " << response.metrics.download_size << " bytes" << std::endl;
-        }
-        
-        if (!response.body.empty()) {
-            std::string preview = response.body.substr(0, 200);
-            if (response.body.length() > 200) preview += "...";
-            std::cout << "Response preview:\n" << preview << std::endl;
-        }
+
+    auto start = std::chrono::steady_clock::now();
+    auto [winner, response] = co_await client.async_race(std::move(requests));
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    std::cout << "Winner: request " << winner << " in " << elapsed.count() << "ms"
+              << " (status " << response.status_code << ")\n";
+}
+
+void expectedExample() {
+    std::cout << "\n=== Expected<T, E> ===" << std::endl;
+
+    auto doRequest = []() -> blaze::Expected<blaze::HttpResponse, blaze::HttpError> {
+        blaze::HttpClient client;
+        auto resp = client.get("https://httpbin.org/status/404");
+        if (!resp.success)
+            return blaze::Unexpected(blaze::HttpError{resp.error_type, resp.error_message});
+        return resp;
+    };
+
+    auto result = doRequest();
+    if (result) {
+        std::cout << "Success: " << result->status_code << "\n";
     } else {
-        std::cout << "Error: " << response.error_message << std::endl;
+        std::cout << "Error: " << result.error().message << "\n";
     }
 }
 
 int main() {
-    std::cout << "Blaze HTTP Client v2.0 - Comprehensive Examples" << std::endl;
-    
-    blaze::HttpClient client;
-    client.setLogLevel(blaze::LogLevel::Info);
-    client.setTimeout(10000);
-    client.setUserAgent("BlazeExample/2.0");
-    
-    printSeparator("Basic GET Request");
-    {
-        auto response = client.get("https://httpbin.org/get");
-        printResponse(response);
+    try {
+        syncExamples();
+        blaze::sync_wait(asyncExamples());
+        blaze::sync_wait(parallelExample());
+        blaze::sync_wait(raceExample());
+        expectedExample();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-    
-    printSeparator("POST with JSON Auto-Detection");
-    {
-        std::string json_body = R"({"name": "Blaze", "version": "2.0"})";
-        auto response = client.post("https://httpbin.org/post", json_body);
-        printResponse(response);
-    }
-    
-    printSeparator("Builder Pattern Example");
-    {
-        auto response = blaze::HttpClient::builder()
-            .url("https://httpbin.org/post")
-            .method("POST")
-            .jsonBody(R"({"builder": "pattern", "easy": true})")
-            .header("X-Custom-Header", "builder-example")
-            .timeout(5000)
-            .send();
-        printResponse(response);
-    }
-    
-    printSeparator("Authentication Examples");
-    {
-        std::cout << "Testing Basic Auth:" << std::endl;
-        auto response = blaze::HttpClient::builder()
-            .url("https://httpbin.org/basic-auth/user/pass")
-            .basicAuth("user", "pass")
-            .send();
-        printResponse(response);
-    }
-    
-    printSeparator("Error Handling Examples");
-    {
-        std::cout << "Invalid URL:" << std::endl;
-        auto response = client.get("not-a-valid-url");
-        printResponse(response);
-        
-        std::cout << "\n404 Not Found:" << std::endl;
-        response = client.get("https://httpbin.org/status/404");
-        printResponse(response);
-    }
-    
-    printSeparator("Asynchronous Requests");
-    {
-        std::cout << "Starting async request..." << std::endl;
-        
-        auto future = client.sendAsync({"https://httpbin.org/delay/1", "GET"});
-        std::cout << "Waiting for response..." << std::endl;
-        
-        auto response = future.get();
-        std::cout << "Async request completed!" << std::endl;
-        printResponse(response);
-    }
-    
-    printSeparator("Streaming Response");
-    {
-        std::cout << "Streaming response from server..." << std::endl;
-        
-        size_t total_received = 0;
-        int chunk_count = 0;
-        
-        blaze::HttpRequest request;
-        request.url = "https://httpbin.org/stream/3";
-        request.method = "GET";
-        
-        auto response = client.streamResponse(request, [&](const char* data, size_t size) {
-            total_received += size;
-            chunk_count++;
-            std::cout << "Received chunk " << chunk_count << ": " << size << " bytes" << std::endl;
-            return chunk_count < 2;
-        });
-        
-        std::cout << "Streaming stopped after " << chunk_count << " chunks" << std::endl;
-        std::cout << "Total received: " << total_received << " bytes" << std::endl;
-    }
-    
-    printSeparator("Utility Functions Demo");
-    {
-        std::string original = "Hello World!";
-        std::string encoded = blaze::utils::urlEncode(original);
-        std::string decoded = blaze::utils::urlDecode(encoded);
-        
-        std::cout << "URL Encoding:" << std::endl;
-        std::cout << "Original: " << original << std::endl;
-        std::cout << "Encoded:  " << encoded << std::endl;
-        std::cout << "Decoded:  " << decoded << std::endl;
-        
-        std::string base64_encoded = blaze::utils::base64Encode("Hello Base64!");
-        std::string base64_decoded = blaze::utils::base64Decode(base64_encoded);
-        
-        std::cout << "\nBase64 Encoding:" << std::endl;
-        std::cout << "Encoded: " << base64_encoded << std::endl;
-        std::cout << "Decoded: " << base64_decoded << std::endl;
-        
-        std::cout << "\nURL Validation:" << std::endl;
-        std::cout << "Valid: https://example.com -> " << blaze::utils::isValidUrl("https://example.com") << std::endl;
-        std::cout << "Invalid: not-a-url -> " << blaze::utils::isValidUrl("not-a-url") << std::endl;
-    }
-    
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "All examples completed successfully!" << std::endl;
-    std::cout << "Blaze HTTP Client v2.0 features demonstrated:" << std::endl;
-    std::cout << "✓ Enhanced error handling and status categorization" << std::endl;
-    std::cout << "✓ Streaming response support" << std::endl;
-    std::cout << "✓ Multiple authentication methods" << std::endl;
-    std::cout << "✓ Builder pattern for request construction" << std::endl;
-    std::cout << "✓ Advanced configuration options" << std::endl;
-    std::cout << "✓ Comprehensive utility functions" << std::endl;
-    std::cout << "✓ Async request support" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-    
     return 0;
 }

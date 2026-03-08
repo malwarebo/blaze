@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../lib/http_client.hpp"
+#include "../lib/blaze.hpp"
 #include <string>
 #include <thread>
 #include <chrono>
@@ -480,6 +480,142 @@ TEST_F(HttpClientPerformanceTest, ConnectionPooling) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
     EXPECT_LT(duration.count(), 20000);
+}
+
+class AsyncHttpClientTest : public ::testing::Test {
+protected:
+    blaze::HttpClient client;
+
+    void SetUp() override {
+        client.setTimeout(10000);
+    }
+};
+
+TEST_F(AsyncHttpClientTest, AsyncGet) {
+    auto response = blaze::sync_wait(client.async_get("https://httpbin.org/get"));
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_FALSE(response.body.empty());
+}
+
+TEST_F(AsyncHttpClientTest, AsyncPost) {
+    auto response = blaze::sync_wait(
+        client.async_post("https://httpbin.org/post", R"({"key":"value"})"));
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_TRUE(response.body.find("\"key\": \"value\"") != std::string::npos);
+}
+
+TEST_F(AsyncHttpClientTest, AsyncInvalidUrl) {
+    auto response = blaze::sync_wait(client.async_get("not-a-url"));
+    EXPECT_FALSE(response.success);
+    EXPECT_EQ(blaze::ErrorType::InvalidUrl, response.error_type);
+}
+
+TEST_F(AsyncHttpClientTest, WhenAll) {
+    auto task = [this]() -> blaze::Task<std::tuple<blaze::HttpResponse, blaze::HttpResponse>> {
+        co_return co_await blaze::when_all(
+            client.async_get("https://httpbin.org/get"),
+            client.async_get("https://httpbin.org/headers")
+        );
+    }();
+
+    auto [r1, r2] = blaze::sync_wait(std::move(task));
+    ASSERT_TRUE(r1.success);
+    ASSERT_TRUE(r2.success);
+    EXPECT_EQ(200, r1.status_code);
+    EXPECT_EQ(200, r2.status_code);
+}
+
+TEST_F(AsyncHttpClientTest, WhenAllConcurrency) {
+    auto task = [this]() -> blaze::Task<std::tuple<blaze::HttpResponse,
+                                                     blaze::HttpResponse,
+                                                     blaze::HttpResponse>> {
+        co_return co_await blaze::when_all(
+            client.async_get("https://httpbin.org/delay/1"),
+            client.async_get("https://httpbin.org/delay/1"),
+            client.async_get("https://httpbin.org/delay/1")
+        );
+    }();
+
+    auto start = std::chrono::steady_clock::now();
+    auto [r1, r2, r3] = blaze::sync_wait(std::move(task));
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    ASSERT_TRUE(r1.success);
+    ASSERT_TRUE(r2.success);
+    ASSERT_TRUE(r3.success);
+    EXPECT_LT(elapsed.count(), 5000);
+}
+
+TEST_F(AsyncHttpClientTest, AsyncRace) {
+    auto task = [this]() -> blaze::Task<std::pair<size_t, blaze::HttpResponse>> {
+        std::vector<blaze::HttpRequest> requests;
+        for (int i = 0; i < 3; ++i) {
+            blaze::HttpRequest req;
+            req.url = "https://httpbin.org/delay/" + std::to_string(i + 1);
+            req.method = "GET";
+            requests.push_back(std::move(req));
+        }
+        co_return co_await client.async_race(std::move(requests));
+    }();
+
+    auto [winner, response] = blaze::sync_wait(std::move(task));
+    EXPECT_EQ(0u, winner);
+    ASSERT_TRUE(response.success);
+    EXPECT_EQ(200, response.status_code);
+}
+
+TEST_F(AsyncHttpClientTest, AsyncInterceptors) {
+    bool req_called = false;
+    bool resp_called = false;
+    client.addRequestInterceptor([&req_called](blaze::HttpRequest& req) {
+        req_called = true;
+        req.headers["X-Async-Intercepted"] = "true";
+    });
+    client.addResponseInterceptor([&resp_called](blaze::HttpResponse& resp) {
+        resp_called = true;
+    });
+
+    auto response = blaze::sync_wait(client.async_get("https://httpbin.org/headers"));
+    ASSERT_TRUE(response.success);
+    EXPECT_TRUE(req_called);
+    EXPECT_TRUE(resp_called);
+    EXPECT_TRUE(response.body.find("X-Async-Intercepted") != std::string::npos);
+}
+
+TEST(HttpVersionTest, ConfigDefault) {
+    blaze::HttpConfig config;
+    EXPECT_EQ(blaze::HttpVersion::Default, config.http_version);
+}
+
+TEST(HttpVersionTest, SetHttpVersion) {
+    blaze::HttpClient client;
+    client.setHttpVersion(blaze::HttpVersion::Http2);
+    EXPECT_EQ(blaze::HttpVersion::Http2, client.getConfig().http_version);
+}
+
+TEST(CancellationTest, ErrorType) {
+    blaze::HttpResponse resp;
+    resp.error_type = blaze::ErrorType::Cancelled;
+    resp.error_message = "Request cancelled";
+    EXPECT_EQ(blaze::ErrorType::Cancelled, resp.error_type);
+}
+
+TEST(ExpectedTest, ValuePath) {
+    blaze::Expected<int, blaze::HttpError> result(42);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(42, result.value());
+    EXPECT_EQ(42, *result);
+}
+
+TEST(ExpectedTest, ErrorPath) {
+    blaze::Expected<int, blaze::HttpError> result(
+        blaze::Unexpected(blaze::HttpError{blaze::ErrorType::NetworkError, "fail"}));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(blaze::ErrorType::NetworkError, result.error().type);
+    EXPECT_EQ("fail", result.error().message);
 }
 
 int main(int argc, char **argv) {

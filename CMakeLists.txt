@@ -1,16 +1,13 @@
 cmake_minimum_required(VERSION 3.14)
-project(blaze VERSION 1.0.0 LANGUAGES CXX)
+project(blaze VERSION 2.0.0 LANGUAGES CXX)
 
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Find libcurl for HTTP requests
 find_package(CURL REQUIRED)
 
-# Main library
-add_library(blaze_http 
+add_library(blaze_http
     lib/http_client.cpp
 )
 
@@ -18,11 +15,26 @@ target_include_directories(blaze_http PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/lib
 )
 
-target_link_libraries(blaze_http PUBLIC 
+target_link_libraries(blaze_http PUBLIC
     CURL::libcurl
 )
 
-# Example executable
+include(GNUInstallDirs)
+
+install(TARGETS blaze_http
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(FILES
+    lib/blaze.hpp
+    lib/types.hpp
+    lib/concepts.hpp
+    lib/task.hpp
+    lib/http_client.hpp
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/blaze
+)
+
 add_executable(blaze_example
     examples/main.cpp
 )
@@ -31,7 +43,6 @@ target_link_libraries(blaze_example PRIVATE
     blaze_http
 )
 
-# Tests
 enable_testing()
 include(FetchContent)
 FetchContent_Declare(

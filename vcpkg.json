@@ -1,0 +1,9 @@
+{
+  "name": "blaze",
+  "version": "2.0.0",
+  "description": "C++20 HTTP client with coroutines, curl_multi async engine, and zero-overhead abstractions",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "curl"
+  ]
+}

@@ -3,11 +3,15 @@
 #include "types.hpp"
 #include "task.hpp"
 #include <memory>
-#include <future>
 
 namespace blaze {
 
 class HttpClientBuilder;
+
+/// Stops the async engine and joins its threads. Optional: the engine is otherwise
+/// intentionally leaked to avoid static-destruction ordering hazards. Call only when
+/// no transfers are outstanding.
+void shutdown();
 
 class HttpClient {
 public:
@@ -21,96 +25,96 @@ public:
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
 
-    HttpResponse get(const std::string& url,
-                     const std::map<std::string, std::string>& headers = {});
-    HttpResponse post(const std::string& url, const std::string& body,
-                      const std::map<std::string, std::string>& headers = {});
-    HttpResponse put(const std::string& url, const std::string& body,
-                     const std::map<std::string, std::string>& headers = {});
-    HttpResponse patch(const std::string& url, const std::string& body,
-                       const std::map<std::string, std::string>& headers = {});
-    HttpResponse del(const std::string& url,
-                     const std::map<std::string, std::string>& headers = {});
-    HttpResponse head(const std::string& url,
-                      const std::map<std::string, std::string>& headers = {});
-    HttpResponse options(const std::string& url,
-                         const std::map<std::string, std::string>& headers = {});
+    HttpResponse get(const std::string& url, const Headers& headers = {});
+    HttpResponse post(const std::string& url,
+                      const std::string& body,
+                      const Headers& headers = {});
+    HttpResponse put(const std::string& url,
+                     const std::string& body,
+                     const Headers& headers = {});
+    HttpResponse patch(const std::string& url,
+                       const std::string& body,
+                       const Headers& headers = {});
+    HttpResponse del(const std::string& url, const Headers& headers = {});
+    HttpResponse head(const std::string& url, const Headers& headers = {});
+    HttpResponse options(const std::string& url, const Headers& headers = {});
     HttpResponse send(const HttpRequest& request);
 
-    Task<HttpResponse> async_get(const std::string& url,
-                                 const std::map<std::string, std::string>& headers = {});
-    Task<HttpResponse> async_post(const std::string& url, const std::string& body,
-                                  const std::map<std::string, std::string>& headers = {});
-    Task<HttpResponse> async_put(const std::string& url, const std::string& body,
-                                 const std::map<std::string, std::string>& headers = {});
-    Task<HttpResponse> async_patch(const std::string& url, const std::string& body,
-                                   const std::map<std::string, std::string>& headers = {});
-    Task<HttpResponse> async_del(const std::string& url,
-                                 const std::map<std::string, std::string>& headers = {});
+    Task<HttpResponse> async_get(const std::string& url, const Headers& headers = {});
+    Task<HttpResponse> async_post(const std::string& url,
+                                  const std::string& body,
+                                  const Headers& headers = {});
+    Task<HttpResponse> async_put(const std::string& url,
+                                 const std::string& body,
+                                 const Headers& headers = {});
+    Task<HttpResponse> async_patch(const std::string& url,
+                                   const std::string& body,
+                                   const Headers& headers = {});
+    Task<HttpResponse> async_del(const std::string& url, const Headers& headers = {});
     Task<HttpResponse> async_send(HttpRequest request);
-    Task<std::pair<size_t, HttpResponse>> async_race(
-        std::vector<HttpRequest> requests);
+    Task<std::pair<size_t, HttpResponse>> async_race(std::vector<HttpRequest> requests);
 
-    std::future<HttpResponse> sendAsync(const HttpRequest& request);
+    HttpResponse send_with_progress(const HttpRequest& request, ProgressCallback callback);
+    HttpResponse stream_response(const HttpRequest& request, StreamCallback callback);
+    HttpResponse upload_file(const std::string& url,
+                             const std::string& file_path,
+                             const std::string& field_name = "file",
+                             const Headers& headers = {});
+    HttpResponse download_file(const std::string& url,
+                               const std::string& file_path,
+                               const Headers& headers = {});
 
-    HttpResponse sendWithProgress(const HttpRequest& request, ProgressCallback callback);
-    HttpResponse streamResponse(const HttpRequest& request, StreamCallback callback);
-    HttpResponse uploadFile(const std::string& url, const std::string& file_path,
-                            const std::string& field_name = "file",
-                            const std::map<std::string, std::string>& headers = {});
-    HttpResponse downloadFile(const std::string& url, const std::string& file_path,
-                              const std::map<std::string, std::string>& headers = {});
+    void set_config(const HttpConfig& config);
+    HttpConfig config() const;
 
-    void setConfig(const HttpConfig& config);
-    HttpConfig getConfig() const;
+    void set_default_header(const std::string& name, const std::string& value);
+    void remove_default_header(const std::string& name);
+    void clear_default_headers();
 
-    void setDefaultHeader(const std::string& name, const std::string& value);
-    void removeDefaultHeader(const std::string& name);
-    void clearDefaultHeaders();
+    void set_timeout(int timeout_ms);
+    void set_connect_timeout(int timeout_ms);
+    void set_follow_redirects(bool follow);
+    void set_max_redirects(int max_redirects);
+    void set_user_agent(const std::string& user_agent);
+    void set_max_response_size(size_t max_size);
 
-    void setTimeout(int timeout_ms);
-    void setConnectTimeout(int timeout_ms);
-    void setFollowRedirects(bool follow);
-    void setMaxRedirects(int max_redirects);
-    void setUserAgent(const std::string& user_agent);
-    void setMaxResponseSize(size_t max_size);
+    void set_auth(const Auth& auth);
+    void set_basic_auth(const std::string& username, const std::string& password);
+    void set_bearer_token(const std::string& token);
+    void set_api_key(const std::string& key, const std::string& header = "X-API-Key");
+    void clear_auth();
 
-    void setAuth(const Auth& auth);
-    void setBasicAuth(const std::string& username, const std::string& password);
-    void setBearerToken(const std::string& token);
-    void setApiKey(const std::string& key, const std::string& header = "X-API-Key");
-    void clearAuth();
+    void set_proxy(const ProxyConfig& proxy);
+    void clear_proxy();
 
-    void setProxy(const ProxyConfig& proxy);
-    void clearProxy();
+    void set_ssl_config(const SSLConfig& ssl);
+    void set_ssl_verification(bool verify_peer, bool verify_host = true);
+    void set_ssl_ca_cert(const std::string& ca_cert_path);
+    void set_ssl_client_cert(const std::string& cert_path, const std::string& key_path);
 
-    void setSSLConfig(const SSLConfig& ssl);
-    void setSSLVerification(bool verify_peer, bool verify_host = true);
-    void setSSLCACert(const std::string& ca_cert_path);
-    void setSSLClientCert(const std::string& cert_path, const std::string& key_path);
+    void set_http_version(HttpVersion version);
 
-    void setHttpVersion(HttpVersion version);
+    void set_retry_config(const RetryConfig& retry);
+    void enable_retry(int max_attempts = 3);
+    void disable_retry();
 
-    void setRetryConfig(const RetryConfig& retry);
-    void enableRetry(int max_attempts = 3);
-    void disableRetry();
+    void add_request_interceptor(RequestInterceptor interceptor);
+    void add_response_interceptor(ResponseInterceptor interceptor);
+    void clear_interceptors();
 
-    void addRequestInterceptor(RequestInterceptor interceptor);
-    void addResponseInterceptor(ResponseInterceptor interceptor);
-    void clearInterceptors();
+    void set_log_level(LogLevel level);
+    void set_log_callback(LogCallback callback);
 
-    void setLogLevel(LogLevel level);
-    void setLogCallback(LogCallback callback);
+    void enable_connection_pooling(int max_connections = 10);
+    void disable_connection_pooling();
 
-    void enableConnectionPooling(int max_connections = 10);
-    void disableConnectionPooling();
+    void clear_cookies();
+    void set_cookie(const std::string& name,
+                    const std::string& value,
+                    const std::string& domain = "");
 
-    void clearCookies();
-    void setCookie(const std::string& name, const std::string& value,
-                   const std::string& domain = "");
-
-    HttpMetrics getConnectionMetrics() const;
-    void resetMetrics();
+    HttpMetrics connection_metrics() const;
+    void reset_metrics();
 
     static HttpClientBuilder builder();
 
@@ -124,23 +128,23 @@ public:
     HttpClientBuilder& url(const std::string& url);
     HttpClientBuilder& method(const std::string& method);
     HttpClientBuilder& header(const std::string& name, const std::string& value);
-    HttpClientBuilder& headers(const std::map<std::string, std::string>& headers);
+    HttpClientBuilder& headers(const Headers& headers);
     HttpClientBuilder& body(const std::string& body);
-    HttpClientBuilder& jsonBody(const std::string& json);
-    HttpClientBuilder& formBody(const std::map<std::string, std::string>& form);
+    HttpClientBuilder& json_body(const std::string& json);
+    HttpClientBuilder& form_body(const Headers& form);
     HttpClientBuilder& timeout(int timeout_ms);
     HttpClientBuilder& auth(const Auth& auth);
-    HttpClientBuilder& basicAuth(const std::string& username, const std::string& password);
-    HttpClientBuilder& bearerToken(const std::string& token);
-    HttpClientBuilder& apiKey(const std::string& key, const std::string& header = "X-API-Key");
-    HttpClientBuilder& followRedirects(bool follow = true);
-    HttpClientBuilder& maxRedirects(int max_redirects);
-    HttpClientBuilder& userAgent(const std::string& user_agent);
-    HttpClientBuilder& enableMetrics(bool enable = true);
+    HttpClientBuilder& basic_auth(const std::string& username, const std::string& password);
+    HttpClientBuilder& bearer_token(const std::string& token);
+    HttpClientBuilder& api_key(const std::string& key,
+                               const std::string& header = "X-API-Key");
+    HttpClientBuilder& follow_redirects(bool follow = true);
+    HttpClientBuilder& max_redirects(int max_redirects);
+    HttpClientBuilder& user_agent(const std::string& user_agent);
+    HttpClientBuilder& enable_metrics(bool enable = true);
 
     HttpRequest build();
     HttpResponse send();
-    std::future<HttpResponse> sendAsync();
 
 private:
     HttpRequest request_;
@@ -148,20 +152,20 @@ private:
 };
 
 namespace auth {
-    Auth basic(const std::string& username, const std::string& password);
-    Auth bearer(const std::string& token);
-    Auth apiKey(const std::string& key, const std::string& header = "X-API-Key");
-}
+Auth basic(const std::string& username, const std::string& password);
+Auth bearer(const std::string& token);
+Auth api_key(const std::string& key, const std::string& header = "X-API-Key");
+}  // namespace auth
 
 namespace utils {
-    std::string urlEncode(const std::string& str);
-    std::string urlDecode(const std::string& str);
-    std::string base64Encode(const std::string& str);
-    std::string base64Decode(const std::string& str);
-    std::map<std::string, std::string> parseQueryString(const std::string& query);
-    std::string buildQueryString(const std::map<std::string, std::string>& params);
-    std::string generateRequestId();
-    bool isValidUrl(const std::string& url);
-}
+std::string url_encode(const std::string& str);
+std::string url_decode(const std::string& str);
+std::string base64_encode(const std::string& str);
+std::string base64_decode(const std::string& str);
+std::map<std::string, std::string> parse_query_string(const std::string& query);
+std::string build_query_string(const std::map<std::string, std::string>& params);
+std::string generate_request_id();
+bool is_valid_url(const std::string& url);
+}  // namespace utils
 
-} // namespace blaze
+}  // namespace blaze

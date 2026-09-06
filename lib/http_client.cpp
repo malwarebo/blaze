@@ -4,17 +4,25 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <coroutine>
 #include <memory>
 
 namespace blaze {
+
+static void set_error(HttpResponse& response, ErrorType type, std::string message) {
+    response.error = HttpError{type, std::move(message)};
+}
 
 static void ensureCurlInitialized() {
     static std::once_flag flag;
@@ -60,7 +68,7 @@ static size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata
 
 static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
     size_t total = size * nitems;
-    auto* headers = static_cast<std::map<std::string, std::string>*>(userdata);
+    auto* headers = static_cast<Headers*>(userdata);
     std::string line(buffer, total);
 
     auto colon = line.find(':');
@@ -69,7 +77,9 @@ static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* use
         std::string value = line.substr(colon + 1);
         auto start = value.find_first_not_of(" \t");
         auto end = value.find_last_not_of(" \t\r\n");
-        if (start != std::string::npos && end != std::string::npos) {
+        if (start == std::string::npos || end == std::string::npos || end < start) {
+            value.clear();
+        } else {
             value = value.substr(start, end - start + 1);
         }
         (*headers)[name] = value;
@@ -77,8 +87,11 @@ static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* use
     return total;
 }
 
-static int CurlProgressCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
-                                 curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+static int CurlProgressCallback(void* clientp,
+                                curl_off_t dltotal,
+                                curl_off_t dlnow,
+                                curl_off_t /*ultotal*/,
+                                curl_off_t /*ulnow*/) {
     auto* data = static_cast<ProgressCallbackData*>(clientp);
     if (data->callback) {
         if (!data->callback(static_cast<size_t>(dlnow), static_cast<size_t>(dltotal))) {
@@ -150,12 +163,17 @@ private:
     LogCallback callback_;
 };
 
+using TransferId = std::uint64_t;
+
+class AsyncEngine;
+
 struct AsyncTransfer {
+    TransferId id{0};
     CURL* easy{nullptr};
     struct curl_slist* header_list{nullptr};
     HttpRequest stored_request;
     std::string response_body;
-    std::map<std::string, std::string> response_headers;
+    Headers response_headers;
     WriteCallbackData write_data{};
     std::atomic<void*> state{nullptr};
     HttpResponse result;
@@ -166,6 +184,7 @@ struct AsyncTransfer {
         if (easy) curl_easy_cleanup(easy);
     }
 
+    /// Runs on a dispatch thread, never on the curl event loop.
     void complete(HttpResponse response) {
         if (race_callback) {
             race_callback(std::move(response));
@@ -174,8 +193,9 @@ struct AsyncTransfer {
         result = std::move(response);
         void* expected = nullptr;
         if (state.compare_exchange_strong(expected,
-                reinterpret_cast<void*>(std::uintptr_t(1)),
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                                          detail::completed_tag(),
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
             return;
         }
         std::coroutine_handle<>::from_address(expected).resume();
@@ -183,26 +203,29 @@ struct AsyncTransfer {
 
     bool try_suspend(std::coroutine_handle<> h) {
         void* expected = nullptr;
-        return state.compare_exchange_strong(expected, h.address(),
-                std::memory_order_acq_rel, std::memory_order_acquire);
+        return state.compare_exchange_strong(
+            expected, h.address(), std::memory_order_acq_rel, std::memory_order_acquire);
     }
 };
+
+static void cancel_transfer(TransferId id);
 
 struct AsyncAwaiter {
     std::shared_ptr<AsyncTransfer> transfer;
 
     bool await_ready() const noexcept {
-        return transfer->state.load(std::memory_order_acquire) ==
-               reinterpret_cast<void*>(std::uintptr_t(1));
+        return transfer->state.load(std::memory_order_acquire) == detail::completed_tag();
     }
 
-    bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+        h.promise().cancel->set([weak = std::weak_ptr<AsyncTransfer>(transfer)] {
+            if (auto t = weak.lock()) cancel_transfer(t->id);
+        });
         return transfer->try_suspend(h);
     }
 
-    HttpResponse await_resume() {
-        return std::move(transfer->result);
-    }
+    HttpResponse await_resume() { return std::move(transfer->result); }
 };
 
 struct RaceState {
@@ -210,6 +233,7 @@ struct RaceState {
     std::atomic<void*> waiter{nullptr};
     size_t winner{0};
     HttpResponse result;
+    std::vector<TransferId> ids;
 };
 
 struct RaceAwaiter {
@@ -219,13 +243,15 @@ struct RaceAwaiter {
         return state->has_winner.load(std::memory_order_acquire);
     }
 
-    bool await_suspend(std::coroutine_handle<> h) noexcept {
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+        h.promise().cancel->set([state = state] {
+            for (auto id : state->ids) cancel_transfer(id);
+        });
+
         void* expected = nullptr;
-        if (state->waiter.compare_exchange_strong(expected, h.address(),
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-            return true;
-        }
-        return false;
+        return state->waiter.compare_exchange_strong(
+            expected, h.address(), std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
     void await_resume() noexcept {}
@@ -248,32 +274,80 @@ static ErrorType mapCurlError(CURLcode code) {
     }
 }
 
+/// Resumes coroutines away from the curl event loop, so a slow continuation
+/// stalls only itself and not every other in-flight transfer.
+class CompletionQueue {
+public:
+    explicit CompletionQueue(unsigned workers) {
+        for (unsigned i = 0; i < workers; ++i) workers_.emplace_back([this] { run(); });
+    }
+
+    ~CompletionQueue() { stop(); }
+
+    void post(std::shared_ptr<AsyncTransfer> transfer, HttpResponse response) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.emplace_back(std::move(transfer), std::move(response));
+        }
+        cv_.notify_one();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_)
+            if (worker.joinable()) worker.join();
+        workers_.clear();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::pair<std::shared_ptr<AsyncTransfer>, HttpResponse> item;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) return;
+                item = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            item.first->complete(std::move(item.second));
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::pair<std::shared_ptr<AsyncTransfer>, HttpResponse>> queue_;
+    std::vector<std::thread> workers_;
+    bool stopping_{false};
+};
+
 class AsyncEngine {
 public:
-    static AsyncEngine& instance() {
-        static AsyncEngine engine;
-        return engine;
-    }
+    static AsyncEngine& instance();
 
     ~AsyncEngine() {
         running_ = false;
         curl_multi_wakeup(multi_);
-        if (thread_.joinable()) {
-            if (thread_.get_id() == std::this_thread::get_id())
-                thread_.detach();
-            else
-                thread_.join();
-        }
+        if (thread_.joinable()) thread_.join();
+
+        completions_.stop();
+
         for (auto& [easy, transfer] : active_) {
             curl_multi_remove_handle(multi_, easy);
-            transfer->easy = nullptr;
         }
         active_.clear();
+        by_id_.clear();
         curl_multi_cleanup(multi_);
     }
 
     AsyncEngine(const AsyncEngine&) = delete;
     AsyncEngine& operator=(const AsyncEngine&) = delete;
+
+    TransferId next_id() { return next_id_.fetch_add(1, std::memory_order_relaxed) + 1; }
 
     void submit(std::shared_ptr<AsyncTransfer> transfer) {
         {
@@ -283,16 +357,18 @@ public:
         curl_multi_wakeup(multi_);
     }
 
-    void cancel(CURL* easy) {
+    /// Cancellation is by id, never by raw easy handle: the loop thread owns those
+    /// and may free one at any moment.
+    void cancel(TransferId id) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            to_cancel_.push_back(easy);
+            to_cancel_.push_back(id);
         }
         curl_multi_wakeup(multi_);
     }
 
 private:
-    AsyncEngine() {
+    AsyncEngine() : completions_(2) {
         ensureCurlInitialized();
         multi_ = curl_multi_init();
         running_ = true;
@@ -327,27 +403,38 @@ private:
             batch.swap(pending_);
         }
         for (auto& t : batch) {
-            curl_multi_add_handle(multi_, t->easy);
-            active_[t->easy] = std::move(t);
+            CURL* easy = t->easy;
+            TransferId id = t->id;
+            curl_multi_add_handle(multi_, easy);
+            by_id_[id] = easy;
+            active_[easy] = std::move(t);
         }
     }
 
     void processCancellations() {
-        std::vector<CURL*> batch;
+        std::vector<TransferId> batch;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             batch.swap(to_cancel_);
         }
-        for (auto* easy : batch) {
+        for (auto id : batch) {
+            auto id_it = by_id_.find(id);
+            if (id_it == by_id_.end()) continue;
+
+            CURL* easy = id_it->second;
+            by_id_.erase(id_it);
+
             auto it = active_.find(easy);
             if (it == active_.end()) continue;
+
             auto transfer = std::move(it->second);
             active_.erase(it);
             curl_multi_remove_handle(multi_, easy);
+
             HttpResponse response;
-            response.error_message = "Request cancelled";
-            response.error_type = ErrorType::Cancelled;
-            transfer->complete(std::move(response));
+            response.request_id = transfer->stored_request.request_id;
+            set_error(response, ErrorType::Cancelled, "Request cancelled");
+            completions_.post(std::move(transfer), std::move(response));
         }
     }
 
@@ -357,6 +444,7 @@ private:
 
         auto transfer = std::move(it->second);
         active_.erase(it);
+        by_id_.erase(transfer->id);
         curl_multi_remove_handle(multi_, easy);
 
         HttpResponse response;
@@ -365,7 +453,6 @@ private:
         response.request_id = transfer->stored_request.request_id;
 
         if (code == CURLE_OK) {
-            response.success = true;
             long http_code;
             curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
             response.status_code = static_cast<int>(http_code);
@@ -391,22 +478,52 @@ private:
             response.metrics.download_size = static_cast<size_t>(download_size);
             response.metrics.upload_speed = upload_speed;
             response.metrics.download_speed = download_speed;
+        } else if (transfer->write_data.size_exceeded) {
+            set_error(response,
+                      ErrorType::ResponseTooLarge,
+                      "Response size exceeded maximum allowed");
         } else {
-            response.error_message = curl_easy_strerror(code);
-            response.error_type = mapCurlError(code);
+            set_error(response, mapCurlError(code), curl_easy_strerror(code));
         }
 
-        transfer->complete(std::move(response));
+        completions_.post(std::move(transfer), std::move(response));
     }
 
     CURLM* multi_;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    std::atomic<TransferId> next_id_{0};
     std::mutex mutex_;
     std::vector<std::shared_ptr<AsyncTransfer>> pending_;
-    std::vector<CURL*> to_cancel_;
+    std::vector<TransferId> to_cancel_;
     std::unordered_map<CURL*, std::shared_ptr<AsyncTransfer>> active_;
+    std::unordered_map<TransferId, CURL*> by_id_;
+    CompletionQueue completions_;
 };
+
+static std::mutex g_engine_mutex;
+static AsyncEngine* g_engine = nullptr;
+
+AsyncEngine& AsyncEngine::instance() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    // Deliberately never destroyed at exit; see blaze::shutdown().
+    if (!g_engine) g_engine = new AsyncEngine();
+    return *g_engine;
+}
+
+static void cancel_transfer(TransferId id) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (g_engine) g_engine->cancel(id);
+}
+
+void shutdown() {
+    AsyncEngine* engine = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        engine = std::exchange(g_engine, nullptr);
+    }
+    delete engine;
+}
 
 class HttpClient::Impl {
 public:
@@ -419,23 +536,76 @@ public:
 
     std::map<std::string, std::string> cookies_;
     HttpMetrics total_metrics_;
-    std::mutex metrics_mutex_;
+    mutable std::mutex metrics_mutex_;
 
-    Impl() : connection_pool_(10) {
-        ensureCurlInitialized();
-    }
+    Impl() : connection_pool_(10) { ensureCurlInitialized(); }
 
     explicit Impl(const HttpConfig& cfg)
         : config_(cfg), connection_pool_(cfg.max_connections) {
         ensureCurlInitialized();
     }
 
-    struct curl_slist* buildHeaderList(
-            const std::map<std::string, std::string>& request_headers,
-            const Auth& effective_auth) {
+    /// Keeps the client alive for as long as a coroutine may still touch it.
+    /// Held in the coroutine frame, so an abandoned request still counts.
+    class AsyncScope {
+    public:
+        explicit AsyncScope(Impl* impl) : impl_(impl) {
+            std::lock_guard<std::mutex> lock(impl_->async_mutex_);
+            ++impl_->outstanding_;
+        }
+
+        ~AsyncScope() { release(); }
+
+        AsyncScope(const AsyncScope&) = delete;
+        AsyncScope& operator=(const AsyncScope&) = delete;
+
+        void track(TransferId id) {
+            std::lock_guard<std::mutex> lock(impl_->async_mutex_);
+            ids_.push_back(id);
+            impl_->live_ids_.insert(id);
+        }
+
+        void release() {
+            if (!impl_) return;
+            Impl* impl = std::exchange(impl_, nullptr);
+            {
+                std::lock_guard<std::mutex> lock(impl->async_mutex_);
+                for (auto id : ids_) impl->live_ids_.erase(id);
+                --impl->outstanding_;
+            }
+            impl->async_cv_.notify_all();
+        }
+
+    private:
+        Impl* impl_;
+        std::vector<TransferId> ids_;
+    };
+
+    /// Cancels anything still in flight and blocks until no coroutine can reach
+    /// this object again. Must not be called from a completion callback.
+    void drain() {
+        std::unique_lock<std::mutex> lock(async_mutex_);
+        while (outstanding_ > 0) {
+            std::vector<TransferId> ids(live_ids_.begin(), live_ids_.end());
+            lock.unlock();
+            for (auto id : ids) cancel_transfer(id);
+            lock.lock();
+            async_cv_.wait_for(
+                lock, std::chrono::milliseconds(50), [this] { return outstanding_ == 0; });
+        }
+    }
+
+    std::mutex async_mutex_;
+    std::condition_variable async_cv_;
+    std::unordered_set<TransferId> live_ids_;
+    int outstanding_{0};
+
+    struct curl_slist* buildHeaderList(const Headers& request_headers,
+                                       const Auth& effective_auth) {
         struct curl_slist* list = nullptr;
 
         for (auto& [k, v] : config_.default_headers) {
+            if (request_headers.count(k)) continue;
             list = curl_slist_append(list, (k + ": " + v).c_str());
         }
 
@@ -455,10 +625,12 @@ public:
         }
 
         if (effective_auth.type == AuthType::Bearer && !effective_auth.token.empty()) {
-            list = curl_slist_append(list,
-                ("Authorization: Bearer " + effective_auth.token).c_str());
-        } else if (effective_auth.type == AuthType::ApiKey && !effective_auth.token.empty()) {
-            list = curl_slist_append(list,
+            list = curl_slist_append(
+                list, ("Authorization: Bearer " + effective_auth.token).c_str());
+        } else if (effective_auth.type == AuthType::ApiKey &&
+                   !effective_auth.token.empty()) {
+            list = curl_slist_append(
+                list,
                 (effective_auth.api_key_header + ": " + effective_auth.token).c_str());
         }
 
@@ -497,27 +669,28 @@ public:
         }
     }
 
-    struct curl_slist* configureCurl(CURL* curl, const HttpRequest& request,
+    struct curl_slist* configureCurl(CURL* curl,
+                                     const HttpRequest& request,
                                      WriteCallbackData* wd,
-                                     std::map<std::string, std::string>* resp_hdrs) {
+                                     Headers* resp_hdrs) {
         curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
 
         if (request.method == "POST") {
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                             static_cast<long>(request.body.size()));
+            curl_easy_setopt(
+                curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
         } else if (request.method == "PUT") {
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                             static_cast<long>(request.body.size()));
+            curl_easy_setopt(
+                curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
         } else if (request.method == "PATCH") {
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                             static_cast<long>(request.body.size()));
+            curl_easy_setopt(
+                curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
         } else if (request.method == "DELETE") {
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
         } else if (request.method == "HEAD") {
@@ -533,24 +706,22 @@ public:
 
         long timeout = static_cast<long>(request.timeout_ms.value_or(config_.timeout_ms));
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
-                         static_cast<long>(config_.connect_timeout_ms));
+        curl_easy_setopt(
+            curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(config_.connect_timeout_ms));
 
         bool follow = request.follow_redirects.value_or(config_.follow_redirects);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
-        curl_easy_setopt(curl, CURLOPT_MAXREDIRS,
-                         static_cast<long>(
-                             request.max_redirects.value_or(config_.max_redirects)));
+        curl_easy_setopt(
+            curl,
+            CURLOPT_MAXREDIRS,
+            static_cast<long>(request.max_redirects.value_or(config_.max_redirects)));
 
-        if (config_.enable_compression)
-            curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-        if (config_.keep_alive)
-            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        if (config_.enable_compression) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+        if (config_.keep_alive) curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
 
         Auth effective_auth = request.auth.value_or(config_.auth);
         struct curl_slist* hdr_list = buildHeaderList(request.headers, effective_auth);
-        if (hdr_list)
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
+        if (hdr_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
         configureAuth(curl, effective_auth);
         configureSSL(curl, config_.ssl);
         configureProxy(curl, config_.proxy);
@@ -558,11 +729,20 @@ public:
         if (config_.http_version != HttpVersion::Default) {
             long ver = CURL_HTTP_VERSION_NONE;
             switch (config_.http_version) {
-                case HttpVersion::Http1_1:  ver = CURL_HTTP_VERSION_1_1; break;
-                case HttpVersion::Http2:    ver = CURL_HTTP_VERSION_2; break;
-                case HttpVersion::Http2TLS: ver = CURL_HTTP_VERSION_2TLS; break;
-                case HttpVersion::Http3:    ver = CURL_HTTP_VERSION_3; break;
-                default: break;
+                case HttpVersion::Http1_1:
+                    ver = CURL_HTTP_VERSION_1_1;
+                    break;
+                case HttpVersion::Http2:
+                    ver = CURL_HTTP_VERSION_2;
+                    break;
+                case HttpVersion::Http2TLS:
+                    ver = CURL_HTTP_VERSION_2TLS;
+                    break;
+                case HttpVersion::Http3:
+                    ver = CURL_HTTP_VERSION_3;
+                    break;
+                default:
+                    break;
             }
             curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, ver);
         }
@@ -613,17 +793,16 @@ public:
         CURLcode res = curl_easy_perform(curl);
 
         if (res == CURLE_OK) {
-            response.success = true;
             long http_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             response.status_code = static_cast<int>(http_code);
             if (request.enable_metrics) extractMetrics(curl, response);
         } else if (wd.size_exceeded) {
-            response.error_message = "Response size exceeded maximum allowed";
-            response.error_type = ErrorType::ResponseTooLarge;
+            set_error(response,
+                      ErrorType::ResponseTooLarge,
+                      "Response size exceeded maximum allowed");
         } else {
-            response.error_message = curl_easy_strerror(res);
-            response.error_type = mapCurlError(res);
+            set_error(response, mapCurlError(res), curl_easy_strerror(res));
         }
 
         if (hdr_list) curl_slist_free_all(hdr_list);
@@ -631,36 +810,33 @@ public:
         return response;
     }
 
+    bool shouldRetry(const HttpResponse& response) const {
+        if (!response.ok()) {
+            // A cancelled or oversized response will not improve by trying again.
+            return response.error_type() != ErrorType::Cancelled &&
+                   response.error_type() != ErrorType::ResponseTooLarge &&
+                   response.error_type() != ErrorType::InvalidUrl;
+        }
+        auto& codes = config_.retry.retry_status_codes;
+        return std::find(codes.begin(), codes.end(), response.status_code) != codes.end();
+    }
+
     HttpResponse performRequest(const HttpRequest& request) {
         auto& retry = config_.retry;
         HttpResponse response = performSingleRequest(request);
 
-        if (response.success || retry.max_attempts <= 1) return response;
-
-        bool should_retry = !response.success;
-        if (response.success) {
-            should_retry = std::find(retry.retry_status_codes.begin(),
-                                     retry.retry_status_codes.end(),
-                                     response.status_code)
-                           != retry.retry_status_codes.end();
-        }
-
-        if (!should_retry) return response;
+        if (retry.max_attempts <= 1 || !shouldRetry(response)) return response;
 
         auto delay = retry.initial_delay;
         for (int attempt = 1; attempt < retry.max_attempts; ++attempt) {
             logger_.log(LogLevel::Info,
-                "Retry attempt " + std::to_string(attempt) + " after " +
-                std::to_string(delay.count()) + "ms");
+                        "Retry attempt " + std::to_string(attempt) + " after " +
+                            std::to_string(delay.count()) + "ms");
             std::this_thread::sleep_for(delay);
+
             response = performSingleRequest(request);
-            if (response.success) {
-                bool status_retry = std::find(retry.retry_status_codes.begin(),
-                                              retry.retry_status_codes.end(),
-                                              response.status_code)
-                                    != retry.retry_status_codes.end();
-                if (!status_retry) return response;
-            }
+            if (!shouldRetry(response)) return response;
+
             delay = std::chrono::milliseconds(
                 static_cast<long long>(delay.count() * retry.backoff_multiplier));
             if (delay > retry.max_delay) delay = retry.max_delay;
@@ -670,33 +846,34 @@ public:
 
     std::shared_ptr<AsyncTransfer> setupTransfer(HttpRequest& request) {
         auto transfer = std::make_shared<AsyncTransfer>();
+        transfer->id = AsyncEngine::instance().next_id();
         transfer->stored_request = request;
         transfer->easy = curl_easy_init();
         transfer->write_data.response_body = &transfer->response_body;
         transfer->write_data.max_size = config_.max_response_size;
 
-        transfer->header_list = configureCurl(
-            transfer->easy, transfer->stored_request,
-            &transfer->write_data, &transfer->response_headers);
+        transfer->header_list = configureCurl(transfer->easy,
+                                              transfer->stored_request,
+                                              &transfer->write_data,
+                                              &transfer->response_headers);
 
         return transfer;
     }
 
-    AsyncAwaiter asyncSetup(HttpRequest request) {
-        if (request.request_id.empty())
-            request.request_id = utils::generateRequestId();
+    AsyncAwaiter asyncSetup(HttpRequest request, AsyncScope& scope) {
+        if (request.request_id.empty()) request.request_id = utils::generate_request_id();
 
-        if (!utils::isValidUrl(request.url)) {
+        if (!utils::is_valid_url(request.url)) {
             auto transfer = std::make_shared<AsyncTransfer>();
             HttpResponse err;
             err.request_id = request.request_id;
-            err.error_message = "Invalid URL: " + request.url;
-            err.error_type = ErrorType::InvalidUrl;
+            set_error(err, ErrorType::InvalidUrl, "Invalid URL: " + request.url);
             transfer->complete(std::move(err));
             return AsyncAwaiter{transfer};
         }
 
         auto transfer = setupTransfer(request);
+        scope.track(transfer->id);
         AsyncEngine::instance().submit(transfer);
         return AsyncAwaiter{transfer};
     }
@@ -714,13 +891,11 @@ public:
         CURLcode res = curl_easy_perform(curl);
 
         if (res == CURLE_OK) {
-            response.success = true;
             long http_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             response.status_code = static_cast<int>(http_code);
         } else {
-            response.error_message = curl_easy_strerror(res);
-            response.error_type = mapCurlError(res);
+            set_error(response, mapCurlError(res), curl_easy_strerror(res));
         }
 
         if (hdr_list) curl_slist_free_all(hdr_list);
@@ -728,7 +903,8 @@ public:
         return response;
     }
 
-    HttpResponse sendWithProgressImpl(const HttpRequest& request, ProgressCallback progress) {
+    HttpResponse sendWithProgressImpl(const HttpRequest& request,
+                                      ProgressCallback progress) {
         HttpResponse response;
         response.request_id = request.request_id;
 
@@ -748,13 +924,13 @@ public:
         CURLcode res = curl_easy_perform(curl);
 
         if (res == CURLE_OK) {
-            response.success = true;
             long http_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             response.status_code = static_cast<int>(http_code);
+        } else if (pd.cancelled) {
+            set_error(response, ErrorType::Cancelled, "Cancelled by progress callback");
         } else {
-            response.error_message = curl_easy_strerror(res);
-            response.error_type = mapCurlError(res);
+            set_error(response, mapCurlError(res), curl_easy_strerror(res));
         }
 
         if (hdr_list) curl_slist_free_all(hdr_list);
@@ -762,9 +938,10 @@ public:
         return response;
     }
 
-    HttpResponse uploadFileImpl(const std::string& url, const std::string& file_path,
+    HttpResponse uploadFileImpl(const std::string& url,
+                                const std::string& file_path,
                                 const std::string& field_name,
-                                const std::map<std::string, std::string>& headers) {
+                                const Headers& headers) {
         HttpResponse response;
 
         CURL* curl = connection_pool_.acquire();
@@ -793,13 +970,11 @@ public:
 
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
-            response.success = true;
             long http_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
             response.status_code = static_cast<int>(http_code);
         } else {
-            response.error_message = curl_easy_strerror(res);
-            response.error_type = mapCurlError(res);
+            set_error(response, mapCurlError(res), curl_easy_strerror(res));
         }
 
         curl_mime_free(mime);
@@ -808,8 +983,9 @@ public:
         return response;
     }
 
-    HttpResponse downloadFileImpl(const std::string& url, const std::string& file_path,
-                                  const std::map<std::string, std::string>& headers) {
+    HttpResponse downloadFileImpl(const std::string& url,
+                                  const std::string& file_path,
+                                  const Headers& headers) {
         HttpRequest request;
         request.url = url;
         request.method = "GET";
@@ -818,35 +994,42 @@ public:
         std::ofstream ofs(file_path, std::ios::binary);
         if (!ofs) {
             HttpResponse err;
-            err.error_message = "Cannot open file: " + file_path;
-            err.error_type = ErrorType::Unknown;
+            set_error(err, ErrorType::Unknown, "Cannot open file: " + file_path);
             return err;
         }
 
-        auto response = streamResponseImpl(request,
-            [&ofs](const char* data, size_t size) -> bool {
+        auto response =
+            streamResponseImpl(request, [&ofs](const char* data, size_t size) -> bool {
                 ofs.write(data, static_cast<std::streamsize>(size));
                 return ofs.good();
             });
 
         ofs.close();
-        if (!response.success) std::remove(file_path.c_str());
+        if (!response.is_success()) std::remove(file_path.c_str());
         return response;
     }
 
-    void log(LogLevel level, const std::string& msg) {
-        logger_.log(level, msg);
-    }
+    void log(LogLevel level, const std::string& msg) { logger_.log(level, msg); }
 };
 
 HttpClient::HttpClient() : pimpl(std::make_unique<Impl>()) {}
 HttpClient::HttpClient(const HttpConfig& config) : pimpl(std::make_unique<Impl>(config)) {}
-HttpClient::~HttpClient() = default;
-HttpClient::HttpClient(HttpClient&&) noexcept = default;
-HttpClient& HttpClient::operator=(HttpClient&&) noexcept = default;
 
-HttpResponse HttpClient::get(const std::string& url,
-                              const std::map<std::string, std::string>& headers) {
+HttpClient::~HttpClient() {
+    if (pimpl) pimpl->drain();
+}
+
+HttpClient::HttpClient(HttpClient&&) noexcept = default;
+
+HttpClient& HttpClient::operator=(HttpClient&& other) noexcept {
+    if (this != &other) {
+        if (pimpl) pimpl->drain();
+        pimpl = std::move(other.pimpl);
+    }
+    return *this;
+}
+
+HttpResponse HttpClient::get(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "GET";
@@ -854,8 +1037,9 @@ HttpResponse HttpClient::get(const std::string& url,
     return send(request);
 }
 
-HttpResponse HttpClient::post(const std::string& url, const std::string& body,
-                               const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::post(const std::string& url,
+                              const std::string& body,
+                              const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "POST";
@@ -870,8 +1054,9 @@ HttpResponse HttpClient::post(const std::string& url, const std::string& body,
     return send(request);
 }
 
-HttpResponse HttpClient::put(const std::string& url, const std::string& body,
-                              const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::put(const std::string& url,
+                             const std::string& body,
+                             const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "PUT";
@@ -880,8 +1065,9 @@ HttpResponse HttpClient::put(const std::string& url, const std::string& body,
     return send(request);
 }
 
-HttpResponse HttpClient::patch(const std::string& url, const std::string& body,
-                                const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::patch(const std::string& url,
+                               const std::string& body,
+                               const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "PATCH";
@@ -890,8 +1076,7 @@ HttpResponse HttpClient::patch(const std::string& url, const std::string& body,
     return send(request);
 }
 
-HttpResponse HttpClient::del(const std::string& url,
-                              const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::del(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "DELETE";
@@ -899,8 +1084,7 @@ HttpResponse HttpClient::del(const std::string& url,
     return send(request);
 }
 
-HttpResponse HttpClient::head(const std::string& url,
-                               const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::head(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "HEAD";
@@ -908,8 +1092,7 @@ HttpResponse HttpClient::head(const std::string& url,
     return send(request);
 }
 
-HttpResponse HttpClient::options(const std::string& url,
-                                  const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::options(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "OPTIONS";
@@ -919,31 +1102,26 @@ HttpResponse HttpClient::options(const std::string& url,
 
 HttpResponse HttpClient::send(const HttpRequest& request) {
     HttpRequest req = request;
-    if (req.request_id.empty())
-        req.request_id = utils::generateRequestId();
+    if (req.request_id.empty()) req.request_id = utils::generate_request_id();
 
-    if (!utils::isValidUrl(req.url)) {
+    if (!utils::is_valid_url(req.url)) {
         HttpResponse err;
         err.request_id = req.request_id;
-        err.error_message = "Invalid URL: " + req.url;
-        err.error_type = ErrorType::InvalidUrl;
+        set_error(err, ErrorType::InvalidUrl, "Invalid URL: " + req.url);
         return err;
     }
 
-    for (auto& interceptor : pimpl->request_interceptors_)
-        interceptor(req);
+    for (auto& interceptor : pimpl->request_interceptors_) interceptor(req);
 
     pimpl->log(LogLevel::Debug, req.method + " " + req.url);
     HttpResponse response = pimpl->performRequest(req);
 
-    for (auto& interceptor : pimpl->response_interceptors_)
-        interceptor(response);
+    for (auto& interceptor : pimpl->response_interceptors_) interceptor(response);
 
     return response;
 }
 
-Task<HttpResponse> HttpClient::async_get(const std::string& url,
-                                          const std::map<std::string, std::string>& headers) {
+Task<HttpResponse> HttpClient::async_get(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "GET";
@@ -951,8 +1129,9 @@ Task<HttpResponse> HttpClient::async_get(const std::string& url,
     return async_send(std::move(request));
 }
 
-Task<HttpResponse> HttpClient::async_post(const std::string& url, const std::string& body,
-                                           const std::map<std::string, std::string>& headers) {
+Task<HttpResponse> HttpClient::async_post(const std::string& url,
+                                          const std::string& body,
+                                          const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "POST";
@@ -967,8 +1146,9 @@ Task<HttpResponse> HttpClient::async_post(const std::string& url, const std::str
     return async_send(std::move(request));
 }
 
-Task<HttpResponse> HttpClient::async_put(const std::string& url, const std::string& body,
-                                          const std::map<std::string, std::string>& headers) {
+Task<HttpResponse> HttpClient::async_put(const std::string& url,
+                                         const std::string& body,
+                                         const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "PUT";
@@ -977,8 +1157,9 @@ Task<HttpResponse> HttpClient::async_put(const std::string& url, const std::stri
     return async_send(std::move(request));
 }
 
-Task<HttpResponse> HttpClient::async_patch(const std::string& url, const std::string& body,
-                                            const std::map<std::string, std::string>& headers) {
+Task<HttpResponse> HttpClient::async_patch(const std::string& url,
+                                           const std::string& body,
+                                           const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "PATCH";
@@ -987,8 +1168,7 @@ Task<HttpResponse> HttpClient::async_patch(const std::string& url, const std::st
     return async_send(std::move(request));
 }
 
-Task<HttpResponse> HttpClient::async_del(const std::string& url,
-                                          const std::map<std::string, std::string>& headers) {
+Task<HttpResponse> HttpClient::async_del(const std::string& url, const Headers& headers) {
     HttpRequest request;
     request.url = url;
     request.method = "DELETE";
@@ -997,252 +1177,311 @@ Task<HttpResponse> HttpClient::async_del(const std::string& url,
 }
 
 Task<HttpResponse> HttpClient::async_send(HttpRequest request) {
-    for (auto& interceptor : pimpl->request_interceptors_)
-        interceptor(request);
+    Impl::AsyncScope scope(pimpl.get());
 
-    auto response = co_await pimpl->asyncSetup(std::move(request));
+    for (auto& interceptor : pimpl->request_interceptors_) interceptor(request);
 
-    for (auto& interceptor : pimpl->response_interceptors_)
-        interceptor(response);
+    auto response = co_await pimpl->asyncSetup(std::move(request), scope);
 
+    for (auto& interceptor : pimpl->response_interceptors_) interceptor(response);
+
+    scope.release();
     co_return response;
 }
 
 Task<std::pair<size_t, HttpResponse>> HttpClient::async_race(
-        std::vector<HttpRequest> requests) {
+    std::vector<HttpRequest> requests) {
     if (requests.empty()) {
         HttpResponse err;
-        err.error_message = "async_race requires at least one request";
-        err.error_type = ErrorType::Unknown;
+        set_error(err, ErrorType::Unknown, "async_race requires at least one request");
         co_return std::pair<size_t, HttpResponse>{0, std::move(err)};
     }
 
     auto state = std::make_shared<RaceState>();
     std::vector<std::shared_ptr<AsyncTransfer>> transfers;
     transfers.reserve(requests.size());
+    state->ids.reserve(requests.size());
+
+    Impl::AsyncScope scope(pimpl.get());
 
     for (size_t i = 0; i < requests.size(); ++i) {
         auto& req = requests[i];
-        if (req.request_id.empty())
-            req.request_id = utils::generateRequestId();
+        if (req.request_id.empty()) req.request_id = utils::generate_request_id();
 
-        for (auto& interceptor : pimpl->request_interceptors_)
-            interceptor(req);
+        for (auto& interceptor : pimpl->request_interceptors_) interceptor(req);
 
         auto transfer = pimpl->setupTransfer(req);
         auto captured_state = state;
         transfer->race_callback = [captured_state, i](HttpResponse resp) {
             bool expected = false;
-            if (captured_state->has_winner.compare_exchange_strong(expected, true,
-                    std::memory_order_acq_rel)) {
+            if (captured_state->has_winner.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
                 captured_state->winner = i;
                 captured_state->result = std::move(resp);
-                void* w = captured_state->waiter.exchange(
-                    reinterpret_cast<void*>(std::uintptr_t(1)),
-                    std::memory_order_acq_rel);
-                if (w && w != reinterpret_cast<void*>(std::uintptr_t(1)))
+                void* w = captured_state->waiter.exchange(detail::completed_tag(),
+                                                          std::memory_order_acq_rel);
+                if (w && w != detail::completed_tag())
                     std::coroutine_handle<>::from_address(w).resume();
             }
         };
+        state->ids.push_back(transfer->id);
+        scope.track(transfer->id);
         transfers.push_back(std::move(transfer));
     }
 
-    for (auto& t : transfers)
-        AsyncEngine::instance().submit(t);
+    for (auto& t : transfers) AsyncEngine::instance().submit(t);
 
     co_await RaceAwaiter{state};
 
-    for (auto& t : transfers) {
-        if (t->easy)
-            AsyncEngine::instance().cancel(t->easy);
-    }
+    // Cancel by id: the loop thread owns the easy handles and may have freed the
+    // winner's already.
+    for (auto id : state->ids) AsyncEngine::instance().cancel(id);
 
-    for (auto& interceptor : pimpl->response_interceptors_)
-        interceptor(state->result);
+    for (auto& interceptor : pimpl->response_interceptors_) interceptor(state->result);
 
+    scope.release();
     co_return std::pair<size_t, HttpResponse>{state->winner, std::move(state->result)};
 }
 
-std::future<HttpResponse> HttpClient::sendAsync(const HttpRequest& request) {
-    HttpRequest req = request;
-    return std::async(std::launch::async, [this, r = std::move(req)] {
-        return send(r);
-    });
-}
-
-HttpResponse HttpClient::sendWithProgress(const HttpRequest& request, ProgressCallback callback) {
+HttpResponse HttpClient::send_with_progress(const HttpRequest& request,
+                                            ProgressCallback callback) {
     return pimpl->sendWithProgressImpl(request, std::move(callback));
 }
 
-HttpResponse HttpClient::streamResponse(const HttpRequest& request, StreamCallback callback) {
+HttpResponse HttpClient::stream_response(const HttpRequest& request,
+                                         StreamCallback callback) {
     return pimpl->streamResponseImpl(request, std::move(callback));
 }
 
-HttpResponse HttpClient::uploadFile(const std::string& url, const std::string& file_path,
+HttpResponse HttpClient::upload_file(const std::string& url,
+                                     const std::string& file_path,
                                      const std::string& field_name,
-                                     const std::map<std::string, std::string>& headers) {
+                                     const Headers& headers) {
     return pimpl->uploadFileImpl(url, file_path, field_name, headers);
 }
 
-HttpResponse HttpClient::downloadFile(const std::string& url, const std::string& file_path,
-                                       const std::map<std::string, std::string>& headers) {
+HttpResponse HttpClient::download_file(const std::string& url,
+                                       const std::string& file_path,
+                                       const Headers& headers) {
     return pimpl->downloadFileImpl(url, file_path, headers);
 }
 
-void HttpClient::setConfig(const HttpConfig& config) { pimpl->config_ = config; }
-HttpConfig HttpClient::getConfig() const { return pimpl->config_; }
+void HttpClient::set_config(const HttpConfig& config) {
+    pimpl->config_ = config;
+}
+HttpConfig HttpClient::config() const {
+    return pimpl->config_;
+}
 
-void HttpClient::setDefaultHeader(const std::string& name, const std::string& value) {
+void HttpClient::set_default_header(const std::string& name, const std::string& value) {
     pimpl->config_.default_headers[name] = value;
 }
-void HttpClient::removeDefaultHeader(const std::string& name) {
+void HttpClient::remove_default_header(const std::string& name) {
     pimpl->config_.default_headers.erase(name);
 }
-void HttpClient::clearDefaultHeaders() { pimpl->config_.default_headers.clear(); }
+void HttpClient::clear_default_headers() {
+    pimpl->config_.default_headers.clear();
+}
 
-void HttpClient::setTimeout(int timeout_ms) { pimpl->config_.timeout_ms = timeout_ms; }
-void HttpClient::setConnectTimeout(int timeout_ms) { pimpl->config_.connect_timeout_ms = timeout_ms; }
-void HttpClient::setFollowRedirects(bool follow) { pimpl->config_.follow_redirects = follow; }
-void HttpClient::setMaxRedirects(int max) { pimpl->config_.max_redirects = max; }
-void HttpClient::setUserAgent(const std::string& ua) { pimpl->config_.user_agent = ua; }
-void HttpClient::setMaxResponseSize(size_t max) { pimpl->config_.max_response_size = max; }
+void HttpClient::set_timeout(int timeout_ms) {
+    pimpl->config_.timeout_ms = timeout_ms;
+}
+void HttpClient::set_connect_timeout(int timeout_ms) {
+    pimpl->config_.connect_timeout_ms = timeout_ms;
+}
+void HttpClient::set_follow_redirects(bool follow) {
+    pimpl->config_.follow_redirects = follow;
+}
+void HttpClient::set_max_redirects(int max) {
+    pimpl->config_.max_redirects = max;
+}
+void HttpClient::set_user_agent(const std::string& ua) {
+    pimpl->config_.user_agent = ua;
+}
+void HttpClient::set_max_response_size(size_t max) {
+    pimpl->config_.max_response_size = max;
+}
 
-void HttpClient::setAuth(const Auth& auth) { pimpl->config_.auth = auth; }
-void HttpClient::setBasicAuth(const std::string& user, const std::string& pass) {
+void HttpClient::set_auth(const Auth& auth) {
+    pimpl->config_.auth = auth;
+}
+void HttpClient::set_basic_auth(const std::string& user, const std::string& pass) {
     pimpl->config_.auth = {AuthType::Basic, user, pass, "", "X-API-Key"};
 }
-void HttpClient::setBearerToken(const std::string& token) {
+void HttpClient::set_bearer_token(const std::string& token) {
     pimpl->config_.auth = {AuthType::Bearer, "", "", token, "X-API-Key"};
 }
-void HttpClient::setApiKey(const std::string& key, const std::string& header) {
+void HttpClient::set_api_key(const std::string& key, const std::string& header) {
     pimpl->config_.auth = {AuthType::ApiKey, "", "", key, header};
 }
-void HttpClient::clearAuth() { pimpl->config_.auth = Auth{}; }
+void HttpClient::clear_auth() {
+    pimpl->config_.auth = Auth{};
+}
 
-void HttpClient::setProxy(const ProxyConfig& proxy) { pimpl->config_.proxy = proxy; }
-void HttpClient::clearProxy() { pimpl->config_.proxy = ProxyConfig{}; }
+void HttpClient::set_proxy(const ProxyConfig& proxy) {
+    pimpl->config_.proxy = proxy;
+}
+void HttpClient::clear_proxy() {
+    pimpl->config_.proxy = ProxyConfig{};
+}
 
-void HttpClient::setSSLConfig(const SSLConfig& ssl) { pimpl->config_.ssl = ssl; }
-void HttpClient::setSSLVerification(bool peer, bool host) {
+void HttpClient::set_ssl_config(const SSLConfig& ssl) {
+    pimpl->config_.ssl = ssl;
+}
+void HttpClient::set_ssl_verification(bool peer, bool host) {
     pimpl->config_.ssl.verify_peer = peer;
     pimpl->config_.ssl.verify_host = host;
 }
-void HttpClient::setSSLCACert(const std::string& path) {
+void HttpClient::set_ssl_ca_cert(const std::string& path) {
     pimpl->config_.ssl.ca_cert_path = path;
 }
-void HttpClient::setSSLClientCert(const std::string& cert, const std::string& key) {
+void HttpClient::set_ssl_client_cert(const std::string& cert, const std::string& key) {
     pimpl->config_.ssl.client_cert_path = cert;
     pimpl->config_.ssl.client_key_path = key;
 }
 
-void HttpClient::setHttpVersion(HttpVersion v) { pimpl->config_.http_version = v; }
+void HttpClient::set_http_version(HttpVersion v) {
+    pimpl->config_.http_version = v;
+}
 
-void HttpClient::setRetryConfig(const RetryConfig& retry) { pimpl->config_.retry = retry; }
-void HttpClient::enableRetry(int max_attempts) {
+void HttpClient::set_retry_config(const RetryConfig& retry) {
+    pimpl->config_.retry = retry;
+}
+void HttpClient::enable_retry(int max_attempts) {
     pimpl->config_.retry.max_attempts = max_attempts;
 }
-void HttpClient::disableRetry() { pimpl->config_.retry.max_attempts = 1; }
+void HttpClient::disable_retry() {
+    pimpl->config_.retry.max_attempts = 1;
+}
 
-void HttpClient::addRequestInterceptor(RequestInterceptor i) {
+void HttpClient::add_request_interceptor(RequestInterceptor i) {
     pimpl->request_interceptors_.push_back(std::move(i));
 }
-void HttpClient::addResponseInterceptor(ResponseInterceptor i) {
+void HttpClient::add_response_interceptor(ResponseInterceptor i) {
     pimpl->response_interceptors_.push_back(std::move(i));
 }
-void HttpClient::clearInterceptors() {
+void HttpClient::clear_interceptors() {
     pimpl->request_interceptors_.clear();
     pimpl->response_interceptors_.clear();
 }
 
-void HttpClient::setLogLevel(LogLevel level) { pimpl->logger_.setLevel(level); }
-void HttpClient::setLogCallback(LogCallback cb) { pimpl->logger_.setCallback(std::move(cb)); }
+void HttpClient::set_log_level(LogLevel level) {
+    pimpl->logger_.setLevel(level);
+}
+void HttpClient::set_log_callback(LogCallback cb) {
+    pimpl->logger_.setCallback(std::move(cb));
+}
 
-void HttpClient::enableConnectionPooling(int max) {
+void HttpClient::enable_connection_pooling(int max) {
     pimpl->config_.max_connections = max;
     pimpl->connection_pool_.resize(max);
 }
-void HttpClient::disableConnectionPooling() {
+void HttpClient::disable_connection_pooling() {
     pimpl->config_.max_connections = 0;
     pimpl->connection_pool_.resize(0);
 }
 
-void HttpClient::clearCookies() { pimpl->cookies_.clear(); }
-void HttpClient::setCookie(const std::string& name, const std::string& value,
+void HttpClient::clear_cookies() {
+    pimpl->cookies_.clear();
+}
+void HttpClient::set_cookie(const std::string& name,
+                            const std::string& value,
                             const std::string& /*domain*/) {
     pimpl->cookies_[name] = value;
 }
 
-HttpMetrics HttpClient::getConnectionMetrics() const {
+HttpMetrics HttpClient::connection_metrics() const {
     std::lock_guard<std::mutex> lock(pimpl->metrics_mutex_);
     return pimpl->total_metrics_;
 }
-void HttpClient::resetMetrics() {
+void HttpClient::reset_metrics() {
     std::lock_guard<std::mutex> lock(pimpl->metrics_mutex_);
     pimpl->total_metrics_ = HttpMetrics{};
 }
 
-HttpClientBuilder HttpClient::builder() { return HttpClientBuilder{}; }
+HttpClientBuilder HttpClient::builder() {
+    return HttpClientBuilder{};
+}
 
-HttpClientBuilder& HttpClientBuilder::url(const std::string& u) { request_.url = u; return *this; }
-HttpClientBuilder& HttpClientBuilder::method(const std::string& m) { request_.method = m; return *this; }
+HttpClientBuilder& HttpClientBuilder::url(const std::string& u) {
+    request_.url = u;
+    return *this;
+}
+HttpClientBuilder& HttpClientBuilder::method(const std::string& m) {
+    request_.method = m;
+    return *this;
+}
 HttpClientBuilder& HttpClientBuilder::header(const std::string& n, const std::string& v) {
     request_.headers[n] = v;
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::headers(const std::map<std::string, std::string>& h) {
+HttpClientBuilder& HttpClientBuilder::headers(const Headers& h) {
     for (auto& [k, v] : h) request_.headers[k] = v;
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::body(const std::string& b) { request_.body = b; return *this; }
-HttpClientBuilder& HttpClientBuilder::jsonBody(const std::string& json) {
+HttpClientBuilder& HttpClientBuilder::body(const std::string& b) {
+    request_.body = b;
+    return *this;
+}
+HttpClientBuilder& HttpClientBuilder::json_body(const std::string& json) {
     request_.body = json;
     request_.headers["Content-Type"] = "application/json";
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::formBody(const std::map<std::string, std::string>& form) {
+HttpClientBuilder& HttpClientBuilder::form_body(const Headers& form) {
     std::string encoded;
     for (auto& [k, v] : form) {
         if (!encoded.empty()) encoded += "&";
-        encoded += utils::urlEncode(k) + "=" + utils::urlEncode(v);
+        encoded += utils::url_encode(k) + "=" + utils::url_encode(v);
     }
     request_.body = encoded;
     request_.headers["Content-Type"] = "application/x-www-form-urlencoded";
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::timeout(int ms) { request_.timeout_ms = ms; return *this; }
-HttpClientBuilder& HttpClientBuilder::auth(const Auth& a) { request_.auth = a; return *this; }
-HttpClientBuilder& HttpClientBuilder::basicAuth(const std::string& u, const std::string& p) {
+HttpClientBuilder& HttpClientBuilder::timeout(int ms) {
+    request_.timeout_ms = ms;
+    return *this;
+}
+HttpClientBuilder& HttpClientBuilder::auth(const Auth& a) {
+    request_.auth = a;
+    return *this;
+}
+HttpClientBuilder& HttpClientBuilder::basic_auth(const std::string& u,
+                                                 const std::string& p) {
     request_.auth = Auth{AuthType::Basic, u, p, "", "X-API-Key"};
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::bearerToken(const std::string& t) {
+HttpClientBuilder& HttpClientBuilder::bearer_token(const std::string& t) {
     request_.auth = Auth{AuthType::Bearer, "", "", t, "X-API-Key"};
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::apiKey(const std::string& k, const std::string& h) {
+HttpClientBuilder& HttpClientBuilder::api_key(const std::string& k, const std::string& h) {
     request_.auth = Auth{AuthType::ApiKey, "", "", k, h};
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::followRedirects(bool f) {
+HttpClientBuilder& HttpClientBuilder::follow_redirects(bool f) {
     request_.follow_redirects = f;
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::maxRedirects(int m) {
+HttpClientBuilder& HttpClientBuilder::max_redirects(int m) {
     request_.max_redirects = m;
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::userAgent(const std::string& ua) {
+HttpClientBuilder& HttpClientBuilder::user_agent(const std::string& ua) {
     request_.headers["User-Agent"] = ua;
     return *this;
 }
-HttpClientBuilder& HttpClientBuilder::enableMetrics(bool e) {
+HttpClientBuilder& HttpClientBuilder::enable_metrics(bool e) {
     request_.enable_metrics = e;
     return *this;
 }
 
-HttpRequest HttpClientBuilder::build() { return request_; }
-HttpResponse HttpClientBuilder::send() { return client_.send(request_); }
-std::future<HttpResponse> HttpClientBuilder::sendAsync() { return client_.sendAsync(request_); }
+HttpRequest HttpClientBuilder::build() {
+    return request_;
+}
+HttpResponse HttpClientBuilder::send() {
+    return client_.send(request_);
+}
 
 Auth auth::basic(const std::string& user, const std::string& pass) {
     return {AuthType::Basic, user, pass, "", "X-API-Key"};
@@ -1250,11 +1489,11 @@ Auth auth::basic(const std::string& user, const std::string& pass) {
 Auth auth::bearer(const std::string& token) {
     return {AuthType::Bearer, "", "", token, "X-API-Key"};
 }
-Auth auth::apiKey(const std::string& key, const std::string& header) {
+Auth auth::api_key(const std::string& key, const std::string& header) {
     return {AuthType::ApiKey, "", "", key, header};
 }
 
-std::string utils::urlEncode(const std::string& str) {
+std::string utils::url_encode(const std::string& str) {
     CURL* curl = curl_easy_init();
     if (!curl) return str;
     char* encoded = curl_easy_escape(curl, str.c_str(), static_cast<int>(str.length()));
@@ -1264,18 +1503,19 @@ std::string utils::urlEncode(const std::string& str) {
     return result;
 }
 
-std::string utils::urlDecode(const std::string& str) {
+std::string utils::url_decode(const std::string& str) {
     CURL* curl = curl_easy_init();
     if (!curl) return str;
     int out_len;
-    char* decoded = curl_easy_unescape(curl, str.c_str(), static_cast<int>(str.length()), &out_len);
+    char* decoded =
+        curl_easy_unescape(curl, str.c_str(), static_cast<int>(str.length()), &out_len);
     std::string result(decoded ? std::string(decoded, out_len) : str);
     if (decoded) curl_free(decoded);
     curl_easy_cleanup(curl);
     return result;
 }
 
-std::string utils::base64Encode(const std::string& str) {
+std::string utils::base64_encode(const std::string& str) {
     static constexpr char table[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -1288,31 +1528,26 @@ std::string utils::base64Encode(const std::string& str) {
             valb -= 6;
         }
     }
-    if (valb > -6)
-        out.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
-    while (out.size() % 4)
-        out.push_back('=');
+    if (valb > -6) out.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
     return out;
 }
 
-std::string utils::base64Decode(const std::string& str) {
+std::string utils::base64_decode(const std::string& str) {
     static constexpr int table[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, 62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1,
+        -1, -1, -1, -1, -1, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28,
+        29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+        49, 50, 51, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     };
     std::string out;
     int val = 0, valb = -8;
@@ -1328,29 +1563,29 @@ std::string utils::base64Decode(const std::string& str) {
     return out;
 }
 
-std::map<std::string, std::string> utils::parseQueryString(const std::string& query) {
+std::map<std::string, std::string> utils::parse_query_string(const std::string& query) {
     std::map<std::string, std::string> params;
     std::istringstream stream(query);
     std::string pair;
     while (std::getline(stream, pair, '&')) {
         auto eq = pair.find('=');
         if (eq != std::string::npos) {
-            params[urlDecode(pair.substr(0, eq))] = urlDecode(pair.substr(eq + 1));
+            params[url_decode(pair.substr(0, eq))] = url_decode(pair.substr(eq + 1));
         }
     }
     return params;
 }
 
-std::string utils::buildQueryString(const std::map<std::string, std::string>& params) {
+std::string utils::build_query_string(const std::map<std::string, std::string>& params) {
     std::string result;
     for (auto& [k, v] : params) {
         if (!result.empty()) result += "&";
-        result += urlEncode(k) + "=" + urlEncode(v);
+        result += url_encode(k) + "=" + url_encode(v);
     }
     return result;
 }
 
-std::string utils::generateRequestId() {
+std::string utils::generate_request_id() {
     thread_local std::mt19937 gen{std::random_device{}()};
     static constexpr char hex[] = "0123456789abcdef";
     std::uniform_int_distribution<int> dist(0, 15);
@@ -1366,14 +1601,14 @@ std::string utils::generateRequestId() {
     return id;
 }
 
-bool utils::isValidUrl(const std::string& url) {
+bool utils::is_valid_url(const std::string& url) {
     if (url.empty()) return false;
     for (char c : url) {
         if (std::isspace(static_cast<unsigned char>(c))) return false;
     }
-    bool has_scheme = (url.compare(0, 7, "http://") == 0) ||
-                      (url.compare(0, 8, "https://") == 0);
+    bool has_scheme =
+        (url.compare(0, 7, "http://") == 0) || (url.compare(0, 8, "https://") == 0);
     return has_scheme;
 }
 
-} // namespace blaze
+}  // namespace blaze

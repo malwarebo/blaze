@@ -8,7 +8,8 @@ void syncExamples() {
     blaze::HttpClient client;
 
     auto response = client.get("https://httpbin.org/get");
-    std::cout << "[GET] " << response.status_code << " (" << response.body.size() << " bytes)\n";
+    std::cout << "[GET] " << response.status_code << " (" << response.body.size()
+              << " bytes)\n";
 
     auto post_resp = client.post("https://httpbin.org/post",
                                  R"({"key":"value"})",
@@ -16,10 +17,10 @@ void syncExamples() {
     std::cout << "[POST] " << post_resp.status_code << "\n";
 
     auto builder_resp = blaze::HttpClient::builder()
-        .url("https://httpbin.org/headers")
-        .method("GET")
-        .header("X-Custom", "blaze")
-        .send();
+                            .url("https://httpbin.org/headers")
+                            .method("GET")
+                            .header("X-Custom", "blaze")
+                            .send();
     std::cout << "[Builder] " << builder_resp.status_code << "\n";
 }
 
@@ -29,11 +30,11 @@ blaze::Task<void> asyncExamples() {
     blaze::HttpClient client;
 
     auto response = co_await client.async_get("https://httpbin.org/get");
-    std::cout << "[async GET] " << response.status_code
-              << " (" << response.body.size() << " bytes)\n";
+    std::cout << "[async GET] " << response.status_code << " (" << response.body.size()
+              << " bytes)\n";
 
-    auto post_resp = co_await client.async_post("https://httpbin.org/post",
-                                                 R"({"async":true})");
+    auto post_resp =
+        co_await client.async_post("https://httpbin.org/post", R"({"async":true})");
     std::cout << "[async POST] " << post_resp.status_code << "\n";
 }
 
@@ -44,18 +45,17 @@ blaze::Task<void> parallelExample() {
 
     auto start = std::chrono::steady_clock::now();
 
-    auto [r1, r2, r3] = co_await blaze::when_all(
-        client.async_get("https://httpbin.org/delay/1"),
-        client.async_get("https://httpbin.org/delay/1"),
-        client.async_get("https://httpbin.org/delay/1")
-    );
+    auto [r1, r2, r3] =
+        co_await blaze::when_all(client.async_get("https://httpbin.org/delay/1"),
+                                 client.async_get("https://httpbin.org/delay/1"),
+                                 client.async_get("https://httpbin.org/delay/1"));
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
 
     std::cout << "3 requests (1s each) completed in " << elapsed.count() << "ms\n";
-    std::cout << "Status codes: " << r1.status_code << ", "
-              << r2.status_code << ", " << r3.status_code << "\n";
+    std::cout << "Status codes: " << r1.status_code << ", " << r2.status_code << ", "
+              << r3.status_code << "\n";
 }
 
 blaze::Task<void> raceExample() {
@@ -80,23 +80,21 @@ blaze::Task<void> raceExample() {
               << " (status " << response.status_code << ")\n";
 }
 
-void expectedExample() {
-    std::cout << "\n=== Expected<T, E> ===" << std::endl;
+void errorHandlingExample() {
+    std::cout << "\n=== Error handling ===" << std::endl;
 
-    auto doRequest = []() -> blaze::Expected<blaze::HttpResponse, blaze::HttpError> {
-        blaze::HttpClient client;
-        auto resp = client.get("https://httpbin.org/status/404");
-        if (!resp.success)
-            return blaze::Unexpected(blaze::HttpError{resp.error_type, resp.error_message});
-        return resp;
-    };
+    blaze::HttpClient client;
 
-    auto result = doRequest();
-    if (result) {
-        std::cout << "Success: " << result->status_code << "\n";
-    } else {
-        std::cout << "Error: " << result.error().message << "\n";
+    auto missing = client.get("https://httpbin.org/status/404");
+    if (!missing.ok()) {
+        std::cout << "Transport failed: " << missing.error_message() << "\n";
+    } else if (missing.is_http_error()) {
+        std::cout << "Server returned " << missing.status_code << "\n";
     }
+
+    auto unreachable = client.get("https://not-a-real-host.invalid/");
+    if (!unreachable.ok())
+        std::cout << "Transport failed: " << unreachable.error_message() << "\n";
 }
 
 int main() {
@@ -105,10 +103,12 @@ int main() {
         blaze::sync_wait(asyncExamples());
         blaze::sync_wait(parallelExample());
         blaze::sync_wait(raceExample());
-        expectedExample();
+        errorHandlingExample();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
+        blaze::shutdown();
         return 1;
     }
+    blaze::shutdown();
     return 0;
 }

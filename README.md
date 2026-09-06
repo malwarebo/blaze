@@ -12,11 +12,7 @@ Every C++ HTTP library is either a thin curl wrapper with no async story, or a B
 
 ## How it works
 
-Sync requests go through `curl_easy_perform` with connection pooling. Async requests submit to a process-global `curl_multi` event loop on a background thread. Each `async_*` call returns a `Task<HttpResponse>` you `co_await`.
-
-Completed transfers are handed to a small dispatch pool rather than resumed on the event loop, so a slow continuation stalls only itself and never blocks other in-flight requests.
-
-`when_all` runs multiple requests concurrently through the same multi handle and waits for all of them even if one fails. `async_race` returns the first to complete and cancels the rest.
+Sync requests go through `curl_easy_perform` with connection pooling. Async requests submit to a process-global `curl_multi` event loop on a background thread. Each `async_*` call returns a `Task<HttpResponse>` you `co_await`. Completions resume on a dispatch pool, not the event loop, so a slow continuation can't stall other transfers. `when_all` runs multiple requests concurrently through the same multi handle and waits for all of them even if one fails. `async_race` returns the first to complete and cancels the rest.
 
 ## Build
 
@@ -29,13 +25,7 @@ cmake --install build --prefix /usr/local
 
 Needs C++20 (GCC 11+, Clang 14+, MSVC 19.29+), CMake 3.14+, libcurl.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `BLAZE_BUILD_TESTS` | on when top-level | Build the test suite |
-| `BLAZE_BUILD_EXAMPLES` | on when top-level | Build the examples |
-| `BLAZE_SANITIZER` | empty | `address`, `thread`, or `undefined` |
-
-Consuming an installed copy:
+Options: `BLAZE_BUILD_TESTS`, `BLAZE_BUILD_EXAMPLES` (both on when top-level), `BLAZE_SANITIZER` (`address`, `thread`, `undefined`).
 
 ```cmake
 find_package(blaze REQUIRED)
@@ -68,26 +58,22 @@ Config, auth, SSL, retry, interceptors, HTTP/2/3, proxy, streaming, file upload/
 
 ## Errors
 
-A response carries an `error` only when the transfer itself failed. A 4xx or 5xx is a completed transfer, so `ok()` is still true:
+`error` is set only when the transfer failed. A 4xx/5xx is a completed transfer, so `ok()` stays true.
 
 ```cpp
-auto r = client.get(url);
-
-if (!r.ok())            // DNS failure, timeout, TLS problem, cancellation
+if (!r.ok())                 // DNS, timeout, TLS, cancellation
     std::cerr << r.error_message();
-else if (r.is_http_error())   // the server answered, with 4xx/5xx
+else if (r.is_http_error())  // server answered 4xx/5xx
     std::cerr << r.status_code;
 ```
 
-Header lookup is case-insensitive, so `r.headers["Content-Type"]` works regardless of how the server or HTTP/2 cased it.
+Header lookup is case-insensitive.
 
 ## Lifetimes
 
-Destroying a `Task` that is still in flight is safe: it detaches, requests cancellation, and the coroutine frame reclaims itself when the transfer finishes.
+Destroying an in-flight `Task` is safe: it detaches, cancels, and the frame reclaims itself. `~HttpClient` cancels and drains its outstanding async work, so don't destroy a client from inside its own callback.
 
-`~HttpClient` cancels any async request it still owns and blocks until none can reach it again, so a client can be destroyed without first joining its outstanding work. Don't destroy a client from inside one of its own callbacks.
-
-The async engine is process-global and intentionally never destroyed at exit, which avoids static-destruction ordering hazards. Call `blaze::shutdown()` if you want its threads joined explicitly, for instance under leak checking.
+The async engine is never destroyed at exit, avoiding static-destruction ordering hazards. Call `blaze::shutdown()` to join its threads explicitly.
 
 ## License
 

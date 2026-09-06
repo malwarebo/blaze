@@ -37,3 +37,83 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure --timeout 60
+
+  sanitizers:
+    name: sanitizer / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBLAZE_SANITIZER=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          TSAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --output-on-failure --timeout 120
+
+  install:
+    name: install + find_package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Build and install
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBLAZE_BUILD_TESTS=OFF -DBLAZE_BUILD_EXAMPLES=OFF
+          cmake --build build -j$(nproc)
+          cmake --install build --prefix "$PWD/stage"
+
+      - name: Consume via find_package
+        run: |
+          mkdir -p consumer
+          cat > consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.14)
+          project(consumer LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          find_package(blaze REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE blaze::blaze)
+          EOF
+          cat > consumer/main.cpp <<'EOF'
+          #include <blaze/blaze.hpp>
+          int main() {
+              blaze::HttpClient client;
+              client.set_timeout(1000);
+              return client.config().timeout_ms == 1000 ? 0 : 1;
+          }
+          EOF
+          cmake -S consumer -B consumer/build -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build consumer/build -j$(nproc)
+          ./consumer/build/consumer
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: |
+          find lib examples tests \( -name '*.hpp' -o -name '*.cpp' \) \
+            -print0 | xargs -0 clang-format --dry-run --Werror

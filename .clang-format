@@ -1,0 +1,25 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+AccessModifierOffset: -4
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Attach
+ColumnLimit: 92
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+DerivePointerAlignment: false
+IndentCaseLabels: true
+IndentWidth: 4
+NamespaceIndentation: None
+PointerAlignment: Left
+SpaceAfterTemplateKeyword: false
+Standard: c++20
+
+IncludeBlocks: Preserve
+SortIncludes: false

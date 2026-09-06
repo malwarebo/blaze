@@ -33,6 +33,7 @@
 
 # Build directory
 build/
+build-*/
 
 # IDE files
 .vscode/

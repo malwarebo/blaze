@@ -1,8 +1,5 @@
 #pragma once
 
-// Minimal in-process HTTP/1.1 server so the suite does not depend on a public
-// service being reachable. POSIX sockets only.
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -47,7 +44,6 @@ struct Request {
 class TestServer {
 public:
     TestServer() {
-        // A client that hangs up mid-response must not take the process with it.
         static std::once_flag once;
         std::call_once(once, [] { ::signal(SIGPIPE, SIG_IGN); });
 
@@ -322,7 +318,6 @@ private:
             return;
         }
 
-        // Deliberately lowercased to exercise case-insensitive header lookup.
         if (path == "/lowercase-headers") {
             respond(
                 fd, 200, "{}", {{"x-custom-reply", "present"}, {"content-language", "en"}});

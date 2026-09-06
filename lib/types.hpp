@@ -11,8 +11,6 @@
 
 namespace blaze {
 
-/// HTTP field names are case-insensitive (RFC 9110 5.1); HTTP/2 lowercases them on the
-/// wire.
 struct CaseInsensitiveLess {
     using is_transparent = void;
 
@@ -70,8 +68,6 @@ struct HttpResponse {
     HttpMetrics metrics;
     std::string request_id;
 
-    /// Empty unless the transfer itself failed. A 4xx/5xx is a completed transfer, not an
-    /// error.
     std::optional<HttpError> error;
 
     bool ok() const { return !error.has_value(); }

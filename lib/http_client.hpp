@@ -8,9 +8,6 @@ namespace blaze {
 
 class HttpClientBuilder;
 
-/// Stops the async engine and joins its threads. Optional: the engine is otherwise
-/// intentionally leaked to avoid static-destruction ordering hazards. Call only when
-/// no transfers are outstanding.
 void shutdown();
 
 class HttpClient {

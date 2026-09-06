@@ -184,7 +184,6 @@ struct AsyncTransfer {
         if (easy) curl_easy_cleanup(easy);
     }
 
-    /// Runs on a dispatch thread, never on the curl event loop.
     void complete(HttpResponse response) {
         if (race_callback) {
             race_callback(std::move(response));
@@ -274,8 +273,6 @@ static ErrorType mapCurlError(CURLcode code) {
     }
 }
 
-/// Resumes coroutines away from the curl event loop, so a slow continuation
-/// stalls only itself and not every other in-flight transfer.
 class CompletionQueue {
 public:
     explicit CompletionQueue(unsigned workers) {
@@ -357,8 +354,6 @@ public:
         curl_multi_wakeup(multi_);
     }
 
-    /// Cancellation is by id, never by raw easy handle: the loop thread owns those
-    /// and may free one at any moment.
     void cancel(TransferId id) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -506,7 +501,6 @@ static AsyncEngine* g_engine = nullptr;
 
 AsyncEngine& AsyncEngine::instance() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    // Deliberately never destroyed at exit; see blaze::shutdown().
     if (!g_engine) g_engine = new AsyncEngine();
     return *g_engine;
 }
@@ -545,8 +539,6 @@ public:
         ensureCurlInitialized();
     }
 
-    /// Keeps the client alive for as long as a coroutine may still touch it.
-    /// Held in the coroutine frame, so an abandoned request still counts.
     class AsyncScope {
     public:
         explicit AsyncScope(Impl* impl) : impl_(impl) {
@@ -581,8 +573,6 @@ public:
         std::vector<TransferId> ids_;
     };
 
-    /// Cancels anything still in flight and blocks until no coroutine can reach
-    /// this object again. Must not be called from a completion callback.
     void drain() {
         std::unique_lock<std::mutex> lock(async_mutex_);
         while (outstanding_ > 0) {
@@ -812,7 +802,6 @@ public:
 
     bool shouldRetry(const HttpResponse& response) const {
         if (!response.ok()) {
-            // A cancelled or oversized response will not improve by trying again.
             return response.error_type() != ErrorType::Cancelled &&
                    response.error_type() != ErrorType::ResponseTooLarge &&
                    response.error_type() != ErrorType::InvalidUrl;
@@ -1233,8 +1222,6 @@ Task<std::pair<size_t, HttpResponse>> HttpClient::async_race(
 
     co_await RaceAwaiter{state};
 
-    // Cancel by id: the loop thread owns the easy handles and may have freed the
-    // winner's already.
     for (auto id : state->ids) AsyncEngine::instance().cancel(id);
 
     for (auto& interceptor : pimpl->response_interceptors_) interceptor(state->result);

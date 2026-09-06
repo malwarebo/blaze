@@ -259,7 +259,6 @@ TEST_F(SyncTest, RetriesConfiguredStatusCodes) {
     auto response = client.get(url("/status/429"));
     ASSERT_TRUE(response.ok());
     EXPECT_EQ(429, response.status_code);
-    // The interceptor runs once per send(); the retries happen beneath it.
     EXPECT_EQ(1, attempts);
 }
 

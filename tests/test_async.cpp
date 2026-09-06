@@ -111,7 +111,6 @@ TEST_F(AsyncTest, WhenAllRunsConcurrently) {
     ASSERT_TRUE(c.ok());
     EXPECT_EQ(200, a.status_code);
 
-    // Three 300ms requests in parallel must beat running them back to back.
     EXPECT_LT(elapsed.count(), 750);
 }
 
@@ -133,7 +132,6 @@ TEST_F(AsyncTest, WhenAllAwaitsSiblingsWhenOneThrows) {
     EXPECT_THROW(blaze::sync_wait(blaze::when_all(failing(), sibling())),
                  std::runtime_error);
 
-    // The sibling must have been awaited to completion rather than abandoned.
     EXPECT_TRUE(sibling_finished.load());
 }
 
@@ -176,15 +174,11 @@ TEST_F(AsyncTest, RaceWithNoRequests) {
 }
 
 TEST_F(AsyncTest, AbandoningRunningTaskIsSafe) {
-    // Regression: destroying a Task whose frame is still owned by the engine used
-    // to free it underneath the loop thread, and the resumed frame then touched a
-    // client that had already gone away.
     blaze::HttpClient local;
     for (int i = 0; i < 20; ++i) {
         auto task = local.async_get(url("/delay/2"));
         task.start();
     }
-    // No sleep: ~HttpClient cancels and drains the abandoned transfers.
 }
 
 TEST_F(AsyncTest, ClientDestructorDrainsPromptly) {
@@ -199,7 +193,6 @@ TEST_F(AsyncTest, ClientDestructorDrainsPromptly) {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
 
-    // Cancellation must beat letting the 900ms requests run to completion.
     EXPECT_LT(elapsed.count(), 700);
 }
 
@@ -219,8 +212,6 @@ TEST_F(AsyncTest, TaskIsMovable) {
 }
 
 TEST_F(AsyncTest, ContinuationsRunOffTheEventLoop) {
-    // Two continuations must be able to overlap. If resumption happened on the
-    // single curl loop thread they would serialise and this would time out.
     std::mutex mutex;
     std::condition_variable cv;
     int arrived = 0;

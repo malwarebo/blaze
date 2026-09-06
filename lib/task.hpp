@@ -17,7 +17,6 @@
 namespace blaze {
 
 namespace detail {
-// Values of promise::waiter. Anything else is the address of an awaiting coroutine.
 inline void* completed_tag() noexcept {
     return reinterpret_cast<void*>(std::uintptr_t(1));
 }
@@ -25,8 +24,6 @@ inline void* detached_tag() noexcept {
     return reinterpret_cast<void*>(std::uintptr_t(2));
 }
 
-/// Lives outside the coroutine frame so an abandoning Task can cancel without
-/// racing the frame's self-destruction.
 class CancelHook {
 public:
     void set(std::function<void()> fn) {
@@ -75,8 +72,6 @@ struct FinalAwaiter {
     void await_resume() noexcept {}
 };
 
-/// Self-destroying driver for sync_wait. Never suspends at the end, so the
-/// waiting thread never has to touch (or destroy) the frame.
 struct SyncWaitCoro {
     struct promise_type {
         SyncWaitCoro get_return_object() noexcept { return {}; }
@@ -159,8 +154,6 @@ public:
     }
 
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
-        // Everything is read before the continuation is published: the instant the
-        // exchange succeeds another thread may resume and destroy this frame.
         auto handle = handle_;
         bool needs_start = !handle.promise().started;
         if (needs_start) handle.promise().started = true;
@@ -190,8 +183,6 @@ public:
     handle_type handle() const { return handle_; }
 
 private:
-    // A started-but-unfinished coroutine may still be owned by the I/O engine, so the
-    // frame is never destroyed here; it reclaims itself in FinalAwaiter.
     void release() noexcept {
         if (!handle_) return;
 
@@ -340,8 +331,6 @@ Task<WhenAllSlot<T>> capture(Task<T> task) {
 }
 }  // namespace detail
 
-/// Runs every task concurrently and waits for all of them, even if some fail.
-/// If several throw, the leftmost exception propagates.
 template<typename... Ts>
 Task<std::tuple<Ts...>> when_all(Task<Ts>... tasks) {
     static_assert(sizeof...(Ts) > 0, "when_all requires at least one task");
@@ -349,8 +338,6 @@ Task<std::tuple<Ts...>> when_all(Task<Ts>... tasks) {
 
     (tasks.start(), ...);
 
-    // Wrapping first makes every co_await below noexcept, so an early failure can
-    // never abandon a sibling that is still in flight.
     std::tuple<detail::WhenAllSlot<Ts>...> slots{
         co_await detail::capture(std::move(tasks))...};
 
@@ -363,9 +350,6 @@ Task<std::tuple<Ts...>> when_all(Task<Ts>... tasks) {
 }
 
 namespace detail {
-// Deliberately not lambdas: a capturing lambda coroutine refers back to a
-// closure object that dies at the end of the full-expression, while these
-// parameters live in the coroutine frame.
 template<typename T>
 SyncWaitCoro sync_wait_driver(Task<T>& task,
                               std::optional<T>& value,
